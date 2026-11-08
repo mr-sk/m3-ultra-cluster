@@ -87,6 +87,16 @@ Limits:
     `</think>` on assistant turns. Every request before 11:00 on 2026-11-08 had
     this.
   - Other models fall back to an emulated `<tool_call>{json}</tool_call>` format.
+- **Thinking mode** (DeepSeek-V4). Off by default. Turn it on per request with
+  `reasoning_effort` (`low`/`medium`/`high`/`max`), `reasoning: {"effort": ...}`
+  or `chat_template_kwargs: {"thinking": true}`, or for every request with
+  `--default-reasoning-effort high`. The prompt is encoded in DeepSeek's
+  `thinking` mode; the reasoning comes back as `reasoning_content` (streamed as
+  its own deltas) and the answer as `content`. Tool calls are only parsed after
+  `</think>`. Thinking defaults: temperature 1.0, top_p 0.95 with tools (DeepSeek's
+  recommendation), max_tokens 32768. `max`/`xhigh` add the preview encoder's
+  effort prompt. Tests: `think_test.py` (offline), `think_live.py`,
+  `think_compare.py`.
 - Default `max_tokens` is 8192. Cline sends none, and the old 2048 default cut
   an answer off at exactly 2048 tokens.
 - Server log: `~/dsv4-server.log` on purple. (`~/vlm-server.log` there is a stale
