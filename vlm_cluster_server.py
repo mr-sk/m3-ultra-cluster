@@ -288,11 +288,10 @@ def run_job(model, processor, job, on_chunk, on_start=None):
             # Every rank sees the same tokens, so every rank stops on the same one.
             text += r.text
             n_tok += 1
-            if marker:
-                # In thinking mode, only the answer after </think> counts.
-                tail = text[text.find(THINK_END):] if job.get("think") else text
-                if (not job.get("think") or THINK_END in text) and marker in tail:
-                    break
+            if marker and marker in text:
+                # Includes a tool call written inside unfinished reasoning: the
+                # preview model sometimes calls a tool without closing </think>.
+                break
             if n_tok % LOOP_EVERY == 0 and looping(text):
                 job["_looped"] = True
                 break
@@ -706,8 +705,15 @@ def make_handler(world, model, processor, config, model_id):
             last = run_job(model, processor, job, on_chunk, on_start if show_stats else None)
             elapsed = time.perf_counter() - t0
             reasoning, src, think_done = split_think(state["text"], job["think"], final=True)
+            topen_ = job["tool_open"]
             if job["think"] and not think_done:
-                reasoning = state["text"]  # ran out of tokens mid-thought: it is all reasoning
+                k = state["text"].find(topen_) if topen_ else -1
+                if k != -1:
+                    # Tool call written inside reasoning that never closed: keep the
+                    # call, treat everything before it as reasoning.
+                    reasoning, src = state["text"][:k].rstrip(), state["text"][k:]
+                else:
+                    reasoning = state["text"]  # ran out mid-thought: all reasoning
             text, _ = apply_stop(src, stops)
             tool_calls = []
             if job["tool_open"]:
