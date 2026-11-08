@@ -14,7 +14,7 @@ import time
 
 import mlx.core as mx
 from mlx_vlm import generate
-from mlx_vlm.prompt_utils import apply_chat_template
+import dsv4_encoding  # DeepSeek's reference encoder (the mlx-community template garbles prompts)
 from mlx_vlm.utils import sharded_load
 
 # Same needle and filler as needle_test.py (copied: that file imports mlx_lm,
@@ -37,7 +37,7 @@ def filler_sentences(seed):
     while True:
         yield f"{rng.choice(SUBJECTS)} {rng.choice(VERBS)} {rng.choice(OBJECTS)} {rng.choice(TAILS)}"
 
-MODEL = "mlx-community/DeepSeek-V4-Flash-4bit"
+MODEL = os.environ.get("DSV4_MODEL", "mlx-community/DeepSeek-V4-Flash-4bit")
 LENGTHS = [int(x) for x in (sys.argv[1].split(",") if len(sys.argv) > 1 else ["2048", "4096", "8192", "16384"])]
 POSITIONS = [0.10, 0.50, 0.90]
 
@@ -68,7 +68,8 @@ def main():
         active_gib=round(mx.get_active_memory() / 2**30, 1), nodes=world.size())
 
     def run(body, question, max_tokens):
-        prompt = apply_chat_template(processor, config, f"{body}\n\n{question}")
+        prompt = dsv4_encoding.encode_messages(
+            [{"role": "user", "content": f"{body}\n\n{question}"}], thinking_mode="chat")
         return generate(model, processor, prompt, max_tokens=max_tokens, temperature=0.0,
                         prefill_step_size=int(os.environ.get("PREFILL_STEP", "2048")))
 
