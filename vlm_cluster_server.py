@@ -487,12 +487,14 @@ def _lenient_decode(tool_name, tool_args):
 dsv4_encoding.decode_dsml_to_arguments = _lenient_decode  # parse_tool_calls looks it up at call time
 
 
-def fill_required(tool_calls, tools, raw=""):
-    """Add "" for required string arguments the model left out.
+def check_required(tool_calls, tools, raw=""):
+    """Log required arguments the model left out. Deliberately does NOT fill them.
 
-    Seen 2026-11-08: DeepSeek called Cline's editor with path and old_text but
-    no new_text (deleting text), and Cline rejected the call. Logs the raw call
-    when it happens.
+    Seen 2026-11-08: DeepSeek called Cline's editor with path and old_text but no
+    new_text. Filling new_text with "" (tried briefly) turns that into a
+    deletion: in one case the model had put its NEW text in old_text, so a
+    match would have deleted tests. A client-side validation error is the safe
+    failure: the model sees it and retries.
     """
     schemas = {}
     for t in tools or []:
@@ -508,12 +510,8 @@ def fill_required(tool_calls, tools, raw=""):
         missing = [k for k in req if k not in args]
         if not missing:
             continue
-        filled = [k for k in missing if (props.get(k) or {}).get("type") == "string"]
-        for k in filled:
-            args[k] = ""
-        c["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
-        log(f"tool call {c['function']['name']}: missing required {missing}, filled {filled} with ''; "
-            f"raw tail {raw[-300:]!r}")
+        log(f"tool call {c['function']['name']}: missing required {missing} (left for the client "
+            f"to reject); raw tail {raw[-300:]!r}")
     return tool_calls
 
 
@@ -781,7 +779,7 @@ def make_handler(world, model, processor, config, model_id):
             if job["tool_open"]:
                 text, tool_calls = (parse_dsml if job["tool_format"] == "dsml" else parse_tool_call)(text)
                 if tool_calls:
-                    fill_required(tool_calls, body.get("tools"), state["text"])
+                    check_required(tool_calls, body.get("tools"), state["text"])
 
             if job.get("_looped"):
                 finish = "length"  # cut short; tell the client it is incomplete

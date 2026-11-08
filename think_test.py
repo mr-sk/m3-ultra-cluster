@@ -69,9 +69,9 @@ etools = [{"type": "function", "function": {"name": "editor", "parameters": {"ty
           "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "line": {"type": "integer"}},
           "required": ["path", "old_text", "new_text", "line"]}}}]
 calls = [{"id": "c", "type": "function", "function": {"name": "editor", "arguments": '{"path": "a.swift", "old_text": "dup"}'}}]
-srv.fill_required(calls, etools, "raw")
+srv.check_required(calls, etools, "raw")
 a2 = __import__("json").loads(calls[0]["function"]["arguments"])
-check("missing required string filled", (a2.get("new_text"), "line" in a2), ("", False))
+check("missing required args are NOT filled", "new_text" in a2, False)
 M = srv.STATS_MARK
 line1 = srv.stats_start_line(111441, 15085)
 check("start line", line1, f"{M} reading 96,356 new tokens (15,085 cached) \u00b7 ~2.2 min to read\n\n")
