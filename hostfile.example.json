@@ -1,0 +1,34 @@
+{
+  "backend": "jaccl",
+  "envs": [],
+  "hosts": [
+    {
+      "ssh": "<node1-lan-ip>",
+      "ips": [
+        "<node1-lan-ip>",
+        "<node1-lan-ip>"
+      ],
+      "rdma": [
+        null,
+        [
+          "rdma_en4",
+          "rdma_en5"
+        ]
+      ]
+    },
+    {
+      "ssh": "<node2-lan-ip>",
+      "ips": [
+        "<node2-lan-ip>",
+        "<node2-lan-ip>"
+      ],
+      "rdma": [
+        [
+          "rdma_en4",
+          "rdma_en5"
+        ],
+        null
+      ]
+    }
+  ]
+}

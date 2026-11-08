@@ -1,0 +1,5 @@
+# ~/vlm-env: the DeepSeek-V4 cluster server and dsv4_run.py. Must match on every node.
+mlx==0.32.4
+mlx-vlm==0.7.12
+numpy==2.5.4
+transformers==5.22.2
