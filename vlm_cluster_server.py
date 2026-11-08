@@ -487,6 +487,36 @@ def _lenient_decode(tool_name, tool_args):
 dsv4_encoding.decode_dsml_to_arguments = _lenient_decode  # parse_tool_calls looks it up at call time
 
 
+def fill_required(tool_calls, tools, raw=""):
+    """Add "" for required string arguments the model left out.
+
+    Seen 2026-11-08: DeepSeek called Cline's editor with path and old_text but
+    no new_text (deleting text), and Cline rejected the call. Logs the raw call
+    when it happens.
+    """
+    schemas = {}
+    for t in tools or []:
+        f = t.get("function", t)
+        schemas[f.get("name")] = f.get("parameters") or {}
+    for c in tool_calls:
+        sch = schemas.get(c["function"]["name"]) or {}
+        props, req = sch.get("properties") or {}, sch.get("required") or []
+        try:
+            args = json.loads(c["function"]["arguments"])
+        except json.JSONDecodeError:
+            continue
+        missing = [k for k in req if k not in args]
+        if not missing:
+            continue
+        filled = [k for k in missing if (props.get(k) or {}).get("type") == "string"]
+        for k in filled:
+            args[k] = ""
+        c["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
+        log(f"tool call {c['function']['name']}: missing required {missing}, filled {filled} with ''; "
+            f"raw tail {raw[-300:]!r}")
+    return tool_calls
+
+
 def parse_dsml(text):
     """Return (content before the calls, [openai tool_call, ...]) or (text, [])."""
     i = text.find(DSML_OPEN)
@@ -750,6 +780,8 @@ def make_handler(world, model, processor, config, model_id):
             tool_calls = []
             if job["tool_open"]:
                 text, tool_calls = (parse_dsml if job["tool_format"] == "dsml" else parse_tool_call)(text)
+                if tool_calls:
+                    fill_required(tool_calls, body.get("tools"), state["text"])
 
             if job.get("_looped"):
                 finish = "length"  # cut short; tell the client it is incomplete
