@@ -460,6 +460,33 @@ def dsv4_prompt(messages, tools, thinking=False, effort=None):
         msgs, thinking_mode="thinking" if thinking else "chat", reasoning_effort=effort)
 
 
+_dsml_fixups = []  # names of arguments rescued by the lenient decoder, per parse
+
+
+def _lenient_decode(tool_name, tool_args):
+    """DeepSeek's decode_dsml_to_arguments, tolerant of mislabelled values.
+
+    The reference decoder pastes string="false" values into the JSON verbatim.
+    When the model labels code as string="false", the result is invalid JSON
+    and clients drop the argument (Cline: "expected string, received undefined
+    at new_text"). Values that don't parse as JSON are kept as strings.
+    """
+    args = {}
+    for key, (value, is_str) in tool_args.items():
+        if is_str == "true":
+            args[key] = value
+            continue
+        try:
+            args[key] = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            args[key] = value
+            _dsml_fixups.append(key)
+    return dict(name=tool_name, arguments=json.dumps(args, ensure_ascii=False))
+
+
+dsv4_encoding.decode_dsml_to_arguments = _lenient_decode  # parse_tool_calls looks it up at call time
+
+
 def parse_dsml(text):
     """Return (content before the calls, [openai tool_call, ...]) or (text, [])."""
     i = text.find(DSML_OPEN)
@@ -469,8 +496,13 @@ def parse_dsml(text):
     j = body.find(DSML_STOP)
     # Generation stops on the closing tag's stem, so put the full tag back.
     body = (body[:j] if j != -1 else body) + DSML_END
+    _dsml_fixups.clear()
     try:
         _, _, calls = dsv4_encoding.parse_tool_calls(0, body)
+        for c in calls:
+            keys = list(json.loads(c["arguments"]).keys())
+            log(f"tool call {c['name']}: args {keys}"
+                + (f" (rescued non-JSON string=false values: {_dsml_fixups})" if _dsml_fixups else ""))
     except Exception as e:
         log(f"DSML tool-call parse failed ({e}); returning raw text")
         return text, []

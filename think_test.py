@@ -55,6 +55,16 @@ jb = srv.build_job({"messages": [{"role": "user", "content": "x"}], "reasoning_e
 check("budget leaves room under client max_tokens", (jb["think_budget"], jb["max_tokens"]), (3072, 4096))
 jb = srv.build_job({"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "high"}, None, {"model_type": "deepseek_v4"})
 check("budget unchanged with default max_tokens", jb["think_budget"], 4096)
+D = "\uff5cDSML\uff5c"
+bad = (f"<{D}tool_calls>\n<{D}invoke name=\"editor\">\n"
+       f"<{D}parameter name=\"path\" string=\"true\">a.swift</{D}parameter>\n"
+       f"<{D}parameter name=\"old_text\" string=\"true\">let x = 1</{D}parameter>\n"
+       f"<{D}parameter name=\"new_text\" string=\"false\">let x = \"two\"\nprint(x)</{D}parameter>\n"
+       f"</{D}invoke>\n</{D}tool_calls>")
+_, calls = srv.parse_dsml("Editing.\n\n" + bad)
+args = __import__("json").loads(calls[0]["function"]["arguments"]) if calls else {}
+check("mislabelled code kept as string", args.get("new_text"), 'let x = "two"\nprint(x)')
+check("other args intact", (args.get("path"), args.get("old_text")), ("a.swift", "let x = 1"))
 M = srv.STATS_MARK
 line1 = srv.stats_start_line(111441, 15085)
 check("start line", line1, f"{M} reading 96,356 new tokens (15,085 cached) \u00b7 ~2.2 min to read\n\n")
