@@ -33,6 +33,7 @@ Limits, on purpose:
 import argparse
 import copy
 import json
+import os
 import random
 import re
 import sys
@@ -600,6 +601,10 @@ def build_job(body, processor, config):
 
 def finish_job(body, prompt, tools, tool_format, think=False):
     temperature, top_p = body.get("temperature"), body.get("top_p")
+    client_max = body.get("max_tokens") or body.get("max_completion_tokens")
+    sources = {"temperature": "client" if temperature is not None else "default",
+               "top_p": "client" if top_p is not None else "default",
+               "max_tokens": "client" if client_max else "default"}
     if think:
         # DeepSeek's recommendation: temperature 1.0, top_p 0.95 for agent work.
         # Greedy decoding tends to loop in long reasoning.
@@ -617,7 +622,42 @@ def finish_job(body, prompt, tools, tool_format, think=False):
         "tool_open": (DSML_OPEN if tool_format == "dsml" else TOOL_OPEN) if tools else None,
         "stop_marker": (DSML_STOP if tool_format == "dsml" else TOOL_STOP) if tools else None,
         "cache": body.get("cache", True) is not False,  # {"cache": false} forces a cold read
+        "param_source": sources,
     }
+
+
+TRACE_DIR = os.path.expanduser("~/dsv4-traces")  # --trace-dir; "" disables (--no-trace)
+
+
+def write_trace(rid, body, job, raw, reasoning, answer, tool_calls, finish, usage, timing):
+    """Save one request/response pair for later analysis and replay (rank 0 only).
+
+    Written after generation finishes, so it cannot affect the lockstep between
+    ranks. Contains the client's full request (messages, tools, sampling) and the
+    model's raw output: local files only, never commit them.
+    """
+    if not TRACE_DIR:
+        return
+    try:
+        day = time.strftime("%Y-%m-%d")
+        folder = os.path.join(TRACE_DIR, day)
+        os.makedirs(folder, exist_ok=True)
+        record = {
+            "id": rid, "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "request": body,
+            "effective": {k: job.get(k) for k in ("think", "think_budget", "max_tokens", "temperature",
+                                                  "top_p", "seed", "tool_format", "cache", "param_source")},
+            "prompt": job.get("prompt"),
+            "output": {"raw": raw, "reasoning": reasoning, "answer": answer,
+                       "tool_calls": tool_calls, "finish_reason": finish,
+                       "looped": bool(job.get("_looped"))},
+            "usage": usage, "cached_tokens": job.get("_reused", 0), "timing": timing,
+        }
+        path = os.path.join(folder, f"{time.strftime('%H%M%S')}-{rid[-8:]}.json")
+        with open(path, "w") as f:
+            json.dump(record, f, ensure_ascii=False)
+    except Exception as e:  # tracing must never break serving
+        log(f"{rid}: trace write failed: {e}")
 
 
 def split_think(raw, think, final=False):
@@ -810,7 +850,14 @@ def make_handler(world, model, processor, config, model_id):
                 f"{usage['prompt_tokens']} prompt ({job.get('_reused', 0)} cached) + {usage['completion_tokens']} gen tokens "
                 f"in {elapsed:.1f}s (prefill {last.prompt_tps if last else 0:.0f} tok/s, "
                 f"decode {last.generation_tps if last else 0:.1f} tok/s){' [client gone]' if state['client_gone'] else ''}"
+                f" | temp {job['temperature']}({job['param_source']['temperature'][0]}) "
+                f"top_p {job['top_p']}({job['param_source']['top_p'][0]})"
                 f" | cache: +{job.get('_new_snaps', 0)} -> {cache_stats()}")
+            write_trace(rid, body, job, job.get("_text", state["text"]), reasoning, text, tool_calls, finish,
+                        usage, {"elapsed_s": round(elapsed, 2),
+                                "prompt_tps": round(last.prompt_tps, 1) if last else None,
+                                "generation_tps": round(last.generation_tps, 1) if last else None,
+                                "client_gone": state["client_gone"]})
 
             if stream:
                 if len(reasoning) > state["rsent"]:  # anything held back at the end
@@ -851,13 +898,15 @@ def make_handler(world, model, processor, config, model_id):
 
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
-    global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING
+    global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--prefill-step", type=int, default=PREFILL_STEP)
     ap.add_argument("--no-prompt-cache", action="store_true")
+    ap.add_argument("--trace-dir", default=TRACE_DIR, help="where rank 0 saves request/response traces")
+    ap.add_argument("--no-trace", action="store_true", help="don't save traces")
     ap.add_argument("--no-stats-in-reasoning", action="store_true",
                     help="don't add the server's status lines to the streamed reasoning")
     ap.add_argument("--default-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
@@ -869,6 +918,7 @@ def main():
     args = ap.parse_args()
     PREFILL_STEP = args.prefill_step
     PROMPT_CACHE = not args.no_prompt_cache
+    TRACE_DIR = "" if args.no_trace else os.path.expanduser(args.trace_dir)
     DEFAULT_REASONING_EFFORT = args.default_reasoning_effort
     STATS_IN_REASONING = not args.no_stats_in_reasoning
     CACHE_MAX_SNAPS = args.cache_max_snapshots
