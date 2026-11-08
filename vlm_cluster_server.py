@@ -34,6 +34,7 @@ import argparse
 import copy
 import json
 import random
+import re
 import sys
 import time
 import uuid
@@ -51,6 +52,9 @@ _dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
 PromptCacheState = importlib.import_module("mlx_vlm.generate.common").PromptCacheState
 
 DEFAULT_MAX_TOKENS = 8192  # Cline sends no max_tokens; 2048 cut its answers off
+THINK_MAX_TOKENS = 32768   # default when thinking: the reasoning alone can run to thousands of tokens
+DEFAULT_REASONING_EFFORT = "none"  # --default-reasoning-effort; "none" = chat mode
+THINK_END = "</think>"
 PROMPT_CACHE = True
 # 2048-token prefill chunks hit a Metal GPU timeout on DeepSeek-V4-Flash at ~4.5k
 # tokens in pipeline mode; 512 avoids it and is also ~2.6x faster.
@@ -219,8 +223,10 @@ def run_job(model, processor, job, on_chunk):
             on_chunk(r)
             if marker:
                 # Every rank sees the same tokens, so every rank stops on the same one.
+                # In thinking mode, only the answer after </think> counts.
                 text += r.text
-                if marker in text:
+                tail = text[text.find(THINK_END):] if job.get("think") else text
+                if (not job.get("think") or THINK_END in text) and marker in tail:
                     break
     finally:
         if sys.exc_info()[0]:
@@ -311,7 +317,41 @@ def is_dsv4(config):
     return (config or {}).get("model_type") == "deepseek_v4"
 
 
-def dsv4_prompt(messages, tools):
+def reasoning_mode(body):
+    """Return (thinking?, effort for the encoder) from an OpenAI-style request.
+
+    Accepts `reasoning_effort` (OpenAI / Cline), `reasoning: {"effort": ...}`, and
+    `chat_template_kwargs: {"thinking": bool}` (vLLM / SGLang style). Falls back
+    to --default-reasoning-effort.
+    """
+    effort = body.get("reasoning_effort")
+    if effort is None and isinstance(body.get("reasoning"), dict):
+        effort = body["reasoning"].get("effort")
+    kw = body.get("chat_template_kwargs") or {}
+    if effort is None and isinstance(kw, dict):
+        flag = kw.get("thinking", kw.get("enable_thinking"))
+        if flag is not None:
+            effort = "high" if flag else "none"
+    if effort is None:
+        effort = DEFAULT_REASONING_EFFORT
+    effort = str(effort).lower()
+    if effort in ("none", "minimal", "off", "false"):
+        return False, None
+    if effort not in ("low", "medium", "high", "max", "xhigh"):
+        raise BadRequest(f"unsupported reasoning_effort: {effort!r}")
+    # The vendored preview encoder knows one effort prompt, which it calls "max"
+    # (the 0731 release encoder renames that text "high" and adds a stronger
+    # "max"). Map the top levels onto it; everything else thinks with no prompt.
+    return True, ("max" if effort in ("max", "xhigh") else None)
+
+
+def _strip_think(content):
+    """Drop <think>…</think> a client may have left inside an earlier assistant turn."""
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    return content.replace("<think>", "").replace("</think>", "")
+
+
+def dsv4_prompt(messages, tools, thinking=False, effort=None):
     """Build the prompt with DeepSeek's encoder, from OpenAI-format messages."""
     msgs = []
     for m in messages:
@@ -320,6 +360,11 @@ def dsv4_prompt(messages, tools):
         if role not in ("system", "user", "assistant", "tool"):
             raise BadRequest(f"unsupported role: {role!r}")
         nm = {"role": role, "content": flatten_content(m.get("content"))}
+        if role == "assistant":
+            nm["content"] = _strip_think(nm["content"])
+            if m.get("reasoning_content"):
+                # The encoder keeps or drops earlier reasoning by its own rules.
+                nm["reasoning_content"] = m["reasoning_content"]
         if role == "assistant" and m.get("tool_calls"):
             nm["tool_calls"] = []
             for c in m["tool_calls"]:
@@ -340,7 +385,8 @@ def dsv4_prompt(messages, tools):
                 break
         else:
             msgs.insert(0, {"role": "system", "content": "", "tools": tools})
-    return dsv4_encoding.encode_messages(msgs, thinking_mode="chat")
+    return dsv4_encoding.encode_messages(
+        msgs, thinking_mode="thinking" if thinking else "chat", reasoning_effort=effort)
 
 
 def parse_dsml(text):
@@ -373,7 +419,9 @@ def build_job(body, processor, config):
     if not isinstance(messages, list) or not messages:
         raise BadRequest("`messages` must be a non-empty list")
     if is_dsv4(config):
-        return finish_job(body, dsv4_prompt(messages, tools), tools, "dsml")
+        thinking, effort = reasoning_mode(body)
+        return finish_job(body, dsv4_prompt(messages, tools, thinking, effort), tools, "dsml",
+                          think=thinking)
     clean = []
     call_names = {}  # tool_call_id -> tool name, so results can be labelled
     for m in messages:
@@ -411,19 +459,46 @@ def build_job(body, processor, config):
     return finish_job(body, prompt, tools, "json")
 
 
-def finish_job(body, prompt, tools, tool_format):
-    temperature = body.get("temperature")
+def finish_job(body, prompt, tools, tool_format, think=False):
+    temperature, top_p = body.get("temperature"), body.get("top_p")
+    if think:
+        # DeepSeek's recommendation: temperature 1.0, top_p 0.95 for agent work.
+        # Greedy decoding tends to loop in long reasoning.
+        temperature = 1.0 if temperature is None else temperature
+        top_p = (0.95 if tools else 1.0) if top_p is None else top_p
     return {
         "prompt": prompt,
-        "max_tokens": int(body.get("max_tokens") or body.get("max_completion_tokens") or DEFAULT_MAX_TOKENS),
+        "think": think,
+        "max_tokens": int(body.get("max_tokens") or body.get("max_completion_tokens")
+                          or (THINK_MAX_TOKENS if think else DEFAULT_MAX_TOKENS)),
         "temperature": 0.0 if temperature is None else float(temperature),
-        "top_p": float(body.get("top_p", 1.0)),
+        "top_p": 1.0 if top_p is None else float(top_p),
         "seed": int(body["seed"]) if body.get("seed") is not None else random.randint(0, 2**31 - 1),
         "tool_format": tool_format,
         "tool_open": (DSML_OPEN if tool_format == "dsml" else TOOL_OPEN) if tools else None,
         "stop_marker": (DSML_STOP if tool_format == "dsml" else TOOL_STOP) if tools else None,
         "cache": body.get("cache", True) is not False,  # {"cache": false} forces a cold read
     }
+
+
+def split_think(raw, think, final=False):
+    """Split generated text into (reasoning, answer, reasoning finished?).
+
+    In thinking mode the prompt ends with "<think>", so the model writes its
+    reasoning, then "</think>", then the answer (and any tool calls). The preview
+    model sometimes closes its reasoning, keeps reasoning, and closes it again,
+    so the final split uses the LAST "</think>"; while streaming, the first one
+    is the earliest point the reasoning can have ended.
+    """
+    if not think:
+        return "", raw, True
+    i = raw.rfind(THINK_END) if final else raw.find(THINK_END)
+    if i == -1:
+        for k in range(len(THINK_END) - 1, 0, -1):  # hold back a partial "</think"
+            if raw.endswith(THINK_END[:k]):
+                return raw[:-k], "", False
+        return raw, "", False
+    return raw[:i], raw[i + len(THINK_END):].lstrip("\n"), True
 
 
 def apply_stop(text, stops):
@@ -486,7 +561,7 @@ def make_handler(world, model, processor, config, model_id):
 
             broadcast(world, job)  # every rank now starts the same job
 
-            state = {"text": "", "sent": 0, "stopped": False, "client_gone": False}
+            state = {"text": "", "sent": 0, "rsent": 0, "stopped": False, "client_gone": False}
 
             def send_sse(obj):
                 if state["client_gone"]:
@@ -514,8 +589,18 @@ def make_handler(world, model, processor, config, model_id):
                 if state["stopped"]:
                     return
                 state["text"] += r.text
+                reasoning, src, _ = split_think(state["text"], job["think"])
+                if stream and len(reasoning) > state["rsent"]:
+                    send_sse(chunk_obj({"reasoning_content": reasoning[state["rsent"]:]}))
+                state["rsent"] = len(reasoning)
+                if job["think"]:
+                    # Stream the reasoning live, but hold the answer until the end:
+                    # a second "</think>" can still turn what follows the first
+                    # one back into reasoning.
+                    return
+                # Stops and tool calls apply to the answer only, never to the reasoning.
                 topen = job["tool_open"]
-                visible, hit = apply_stop(state["text"], stops + ([topen] if topen else []))
+                visible, hit = apply_stop(src, stops + ([topen] if topen else []))
                 if topen and not hit:
                     # don't stream a partial opening tag that may still be completing
                     for k in range(len(topen) - 1, 0, -1):
@@ -523,10 +608,10 @@ def make_handler(world, model, processor, config, model_id):
                             visible = visible[:-k]
                             break
                     hit = False
-                if topen and topen in state["text"]:
+                if topen and topen in src:
                     visible = visible.rstrip()  # the blank line before the calls block
-                if hit and not (topen and topen in state["text"]
-                                and not any(st in state["text"] for st in stops)):
+                if hit and not (topen and topen in src
+                                and not any(st in src for st in stops)):
                     state["stopped"] = True
                 if stream and len(visible) > state["sent"]:
                     send_sse(chunk_obj({"content": visible[state["sent"]:]}))
@@ -535,7 +620,10 @@ def make_handler(world, model, processor, config, model_id):
             t0 = time.perf_counter()
             last = run_job(model, processor, job, on_chunk)
             elapsed = time.perf_counter() - t0
-            text, _ = apply_stop(state["text"], stops)
+            reasoning, src, think_done = split_think(state["text"], job["think"], final=True)
+            if job["think"] and not think_done:
+                reasoning = state["text"]  # ran out of tokens mid-thought: it is all reasoning
+            text, _ = apply_stop(src, stops)
             tool_calls = []
             if job["tool_open"]:
                 text, tool_calls = (parse_dsml if job["tool_format"] == "dsml" else parse_tool_call)(text)
@@ -553,15 +641,19 @@ def make_handler(world, model, processor, config, model_id):
                 "completion_tokens": last.generation_tokens if last else 0,
                 "total_tokens": (last.prompt_tokens + last.generation_tokens) if last else 0,
             }
-            log(f"{rid}: {'[tool ' + ', '.join(c['function']['name'] for c in tool_calls) + '] ' if tool_calls else ''}"
+            log(f"{rid}: {f'[think {len(reasoning)} chars] ' if job['think'] else ''}"
+                f"{'[tool ' + ', '.join(c['function']['name'] for c in tool_calls) + '] ' if tool_calls else ''}"
                 f"{usage['prompt_tokens']} prompt ({job.get('_reused', 0)} cached) + {usage['completion_tokens']} gen tokens "
                 f"in {elapsed:.1f}s (prefill {last.prompt_tps if last else 0:.0f} tok/s, "
                 f"decode {last.generation_tps if last else 0:.1f} tok/s){' [client gone]' if state['client_gone'] else ''}"
                 f" | cache: +{job.get('_new_snaps', 0)} -> {cache_stats()}")
 
             if stream:
-                if job["tool_open"] and not tool_calls and len(text) > state["sent"]:
-                    send_sse(chunk_obj({"content": text[state["sent"]:]}))  # unparsed remainder
+                if len(reasoning) > state["rsent"]:  # anything held back at the end
+                    send_sse(chunk_obj({"reasoning_content": reasoning[state["rsent"]:]}))
+                if len(text) > state["sent"] and (job["think"] or (job["tool_open"] and not tool_calls)):
+                    # thinking: the whole answer (held until now); otherwise any unparsed remainder
+                    send_sse(chunk_obj({"content": text[state["sent"]:]}))
                 if tool_calls:
                     send_sse(chunk_obj({"tool_calls": [dict(c, index=i) for i, c in enumerate(tool_calls)]}))
                 final = chunk_obj({}, finish)
@@ -579,6 +671,7 @@ def make_handler(world, model, processor, config, model_id):
                     "id": rid, "object": "chat.completion", "created": created, "model": model_id,
                     "choices": [{"index": 0, "message": dict(
                                      {"role": "assistant", "content": text or (None if tool_calls else "")},
+                                     **({"reasoning_content": reasoning} if job["think"] else {}),
                                      **({"tool_calls": tool_calls} if tool_calls else {})),
                                  "finish_reason": finish}],
                     "usage": usage,
@@ -589,18 +682,23 @@ def make_handler(world, model, processor, config, model_id):
 
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
+    global DEFAULT_REASONING_EFFORT
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--prefill-step", type=int, default=PREFILL_STEP)
     ap.add_argument("--no-prompt-cache", action="store_true")
+    ap.add_argument("--default-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
+                    choices=["none", "low", "medium", "high", "max"],
+                    help="thinking mode for requests that don't ask (DeepSeek-V4 only)")
     ap.add_argument("--cache-max-snapshots", type=int, default=CACHE_MAX_SNAPS)
     ap.add_argument("--cache-budget-tokens", type=int, default=CACHE_BUDGET_TOKENS)
     ap.add_argument("--cache-checkpoint-gap", type=int, default=CACHE_CKPT_GAP)
     args = ap.parse_args()
     PREFILL_STEP = args.prefill_step
     PROMPT_CACHE = not args.no_prompt_cache
+    DEFAULT_REASONING_EFFORT = args.default_reasoning_effort
     CACHE_MAX_SNAPS = args.cache_max_snapshots
     CACHE_BUDGET_TOKENS = args.cache_budget_tokens
     CACHE_CKPT_GAP = args.cache_checkpoint_gap
