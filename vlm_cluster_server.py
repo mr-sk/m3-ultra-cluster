@@ -55,6 +55,47 @@ DEFAULT_MAX_TOKENS = 8192  # Cline sends no max_tokens; 2048 cut its answers off
 THINK_MAX_TOKENS = 32768   # default when thinking: the reasoning alone can run to thousands of tokens
 DEFAULT_REASONING_EFFORT = "none"  # --default-reasoning-effort; "none" = chat mode
 THINK_END = "</think>"
+# Status lines the server adds to the reasoning stream (Cline shows them in its
+# "Thinking" section). Marked so they can be stripped from history before the
+# model ever sees them. --no-stats-in-reasoning turns them off.
+STATS_IN_REASONING = True
+STATS_MARK = "\u27e6cluster\u27e7"   # ⟦cluster⟧
+PREFILL_EST = [730.0]                 # new-token prefill rate, tok/s; updated as we go
+
+
+def _fmt_secs(t):
+    return f"{t:.0f}s" if t < 90 else f"{t / 60:.1f} min"
+
+
+def strip_stats(text):
+    """Remove the server's own status lines from text a client sent back."""
+    if not text or STATS_MARK not in text:
+        return text
+    return re.sub(r"[^\n]*" + re.escape(STATS_MARK) + r"[^\n]*\n?", "", text).strip()
+
+
+def stats_start_line(total, reused):
+    new = total - reused
+    eta = new / PREFILL_EST[0]
+    est = f" \u00b7 ~{_fmt_secs(eta)} to read" if eta >= 3 else ""
+    return f"{STATS_MARK} reading {new:,} new token{'' if new == 1 else 's'} ({reused:,} cached){est}\n\n"
+
+
+def stats_end_line(prompt_tokens, reused, gen_tokens, prompt_tps, gen_tps, elapsed, cs, lead="\n\n"):
+    new = prompt_tokens - reused
+    read_s = prompt_tokens / prompt_tps if prompt_tps else 0.0
+    return (f"{lead}{STATS_MARK} {gen_tokens:,} tokens at {gen_tps:.1f} tok/s \u00b7 "
+            f"read {new:,} new + {reused:,} cached in {_fmt_secs(read_s)} \u00b7 "
+            f"{_fmt_secs(elapsed)} total \u00b7 cache {cs['snapshots']} saved "
+            f"({cs['tokens'] / 1000:.0f}k tok) \u00b7 peak {cs['peak_gib']} GiB")
+
+
+def update_prefill_estimate(prompt_tokens, reused, prompt_tps):
+    """Learn the cold prefill rate from turns that read a lot of new tokens."""
+    new = prompt_tokens - reused
+    if new >= 2048 and prompt_tps:
+        rate = new / (prompt_tokens / prompt_tps)
+        PREFILL_EST[0] = 0.7 * PREFILL_EST[0] + 0.3 * rate
 PROMPT_CACHE = True
 # 2048-token prefill chunks hit a Metal GPU timeout on DeepSeek-V4-Flash at ~4.5k
 # tokens in pipeline mode; 512 avoids it and is also ~2.6x faster.
@@ -107,9 +148,10 @@ def cache_stats():
 
 def _prepare_hook(*a, **kw):
     out = _orig_prepare(*a, **kw)
-    if _req.get("active"):
+    if _req.get("active") or _req.get("on_start"):
         ids = out[0].flatten().tolist()
         _req["full_ids"] = ids
+    if _req.get("active"):
         best = None
         for snap in SNAPS:
             n = len(snap["ids"])
@@ -127,6 +169,8 @@ def _prepare_hook(*a, **kw):
             _req["reused"] = len(best["ids"])
         else:
             pcs.cache = None
+    if _req.get("on_start"):
+        _req["on_start"](len(_req["full_ids"]), _req.get("reused", 0))
     return out
 
 
@@ -197,7 +241,7 @@ def broadcast(world, obj=None):
     return json.loads(np.array(buf).astype(np.uint8).tobytes().decode())
 
 
-def run_job(model, processor, job, on_chunk):
+def run_job(model, processor, job, on_chunk, on_start=None):
     """Generate for one job. Runs identically on every rank."""
     mx.random.seed(job["seed"])  # same seed everywhere, so sampled tokens match
     last = None
@@ -206,7 +250,7 @@ def run_job(model, processor, job, on_chunk):
     use_cache = job.get("cache", True) and PROMPT_CACHE
     pcs = PromptCacheState() if use_cache else None  # filled in by _prepare_hook
     _req.clear()
-    _req.update(active=use_cache, pcs=pcs, reused=0, snapshots=0)
+    _req.update(active=use_cache, pcs=pcs, reused=0, snapshots=0, on_start=on_start)
     extra = {"prompt_cache_state": pcs} if pcs is not None else {}
     try:
         for r in stream_generate(
@@ -364,7 +408,9 @@ def dsv4_prompt(messages, tools, thinking=False, effort=None):
             nm["content"] = _strip_think(nm["content"])
             if m.get("reasoning_content"):
                 # The encoder keeps or drops earlier reasoning by its own rules.
-                nm["reasoning_content"] = m["reasoning_content"]
+                rc = strip_stats(m["reasoning_content"])
+                if rc:
+                    nm["reasoning_content"] = rc
         if role == "assistant" and m.get("tool_calls"):
             nm["tool_calls"] = []
             for c in m["tool_calls"]:
@@ -618,7 +664,12 @@ def make_handler(world, model, processor, config, model_id):
                 state["sent"] = len(visible)
 
             t0 = time.perf_counter()
-            last = run_job(model, processor, job, on_chunk)
+            show_stats = stream and STATS_IN_REASONING
+
+            def on_start(total, reused):
+                send_sse(chunk_obj({"reasoning_content": stats_start_line(total, reused)}))
+
+            last = run_job(model, processor, job, on_chunk, on_start if show_stats else None)
             elapsed = time.perf_counter() - t0
             reasoning, src, think_done = split_think(state["text"], job["think"], final=True)
             if job["think"] and not think_done:
@@ -636,6 +687,8 @@ def make_handler(world, model, processor, config, model_id):
                 finish = "length"
             else:
                 finish = "stop"
+            if last is not None:
+                update_prefill_estimate(last.prompt_tokens, job.get("_reused", 0), last.prompt_tps)
             usage = {
                 "prompt_tokens": last.prompt_tokens if last else 0,
                 "completion_tokens": last.generation_tokens if last else 0,
@@ -651,6 +704,11 @@ def make_handler(world, model, processor, config, model_id):
             if stream:
                 if len(reasoning) > state["rsent"]:  # anything held back at the end
                     send_sse(chunk_obj({"reasoning_content": reasoning[state["rsent"]:]}))
+                if show_stats and last is not None:
+                    send_sse(chunk_obj({"reasoning_content": stats_end_line(
+                        last.prompt_tokens, job.get("_reused", 0), last.generation_tokens,
+                        last.prompt_tps, last.generation_tps, elapsed, cache_stats(),
+                        lead="\n\n" if reasoning else "")}))
                 if len(text) > state["sent"] and (job["think"] or (job["tool_open"] and not tool_calls)):
                     # thinking: the whole answer (held until now); otherwise any unparsed remainder
                     send_sse(chunk_obj({"content": text[state["sent"]:]}))
@@ -682,13 +740,15 @@ def make_handler(world, model, processor, config, model_id):
 
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
-    global DEFAULT_REASONING_EFFORT
+    global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--prefill-step", type=int, default=PREFILL_STEP)
     ap.add_argument("--no-prompt-cache", action="store_true")
+    ap.add_argument("--no-stats-in-reasoning", action="store_true",
+                    help="don't add the server's status lines to the streamed reasoning")
     ap.add_argument("--default-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
                     choices=["none", "low", "medium", "high", "max"],
                     help="thinking mode for requests that don't ask (DeepSeek-V4 only)")
@@ -699,6 +759,7 @@ def main():
     PREFILL_STEP = args.prefill_step
     PROMPT_CACHE = not args.no_prompt_cache
     DEFAULT_REASONING_EFFORT = args.default_reasoning_effort
+    STATS_IN_REASONING = not args.no_stats_in_reasoning
     CACHE_MAX_SNAPS = args.cache_max_snapshots
     CACHE_BUDGET_TOKENS = args.cache_budget_tokens
     CACHE_CKPT_GAP = args.cache_checkpoint_gap
@@ -721,6 +782,17 @@ def main():
         f"{CACHE_BUDGET_TOKENS} token budget, checkpoint ids {sorted(BOUNDARY_IDS)}")
     log(f"rank {rank}/{world.size()}: loaded {args.model} in {time.perf_counter() - t0:.0f}s, "
         f"{mx.get_active_memory() / 2**30:.1f} GiB active")
+
+    # Warm up before serving: the first pass compiles kernels and touches every
+    # weight. In pipeline mode rank 0's GPU work waits on the other ranks, so a
+    # slow first pass can hit macOS's GPU watchdog (seen 2026-11-08 on a 9-token
+    # request that arrived the second the server came up). All ranks run it.
+    t1 = time.perf_counter()
+    # One attempt only: a GPU timeout can leave the ranks out of step, so fail
+    # loudly at startup rather than retry.
+    run_job(model, processor, {"prompt": "Hello", "max_tokens": 4, "temperature": 0.0,
+                               "top_p": 1.0, "seed": 0, "cache": False}, lambda r: None)
+    log(f"rank {rank}: warm-up done in {time.perf_counter() - t1:.1f}s")
 
     if rank != 0:
         # Worker: wait for jobs from rank 0 and generate in lockstep, forever.

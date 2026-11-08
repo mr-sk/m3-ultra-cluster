@@ -97,6 +97,16 @@ Limits:
   recommendation), max_tokens 32768. `max`/`xhigh` add the preview encoder's
   effort prompt. Tests: `think_test.py` (offline), `think_live.py`,
   `think_compare.py`.
+- **Status lines in the reasoning stream** (streaming requests). The server adds
+  `⟦cluster⟧` lines to `reasoning_content`, which Cline shows in its Thinking
+  section: one before the prompt is read (new vs cached tokens, estimated read
+  time from a running average) and one at the end (tokens, tok/s, read time,
+  total time, cache state, peak GPU memory). Lines carrying the marker are
+  stripped from any history a client sends back, so the model never sees them.
+  `--no-stats-in-reasoning` turns them off.
+- **Warm-up before serving.** All ranks run a tiny generation after loading (about
+  7 s; a normal tiny request takes 0.3 s). Without it, a request arriving the
+  moment the server came up crashed both ranks with a Metal GPU timeout.
 - Default `max_tokens` is 8192. Cline sends none, and the old 2048 default cut
   an answer off at exactly 2048 tokens.
 - Server log: `~/dsv4-server.log` on purple. (`~/vlm-server.log` there is a stale

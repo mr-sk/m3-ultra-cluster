@@ -45,4 +45,23 @@ j = srv.finish_job({"temperature": 0.2}, "P", [], "dsml", think=True)
 check("think respects client temp", (j["temperature"], j["top_p"]), (0.2, 1.0))
 j = srv.finish_job({}, "P", [], "dsml")
 check("chat defaults unchanged", (j["temperature"], j["top_p"], j["max_tokens"], j["think"]), (0.0, 1.0, 8192, False))
+M = srv.STATS_MARK
+line1 = srv.stats_start_line(111441, 15085)
+check("start line", line1, f"{M} reading 96,356 new tokens (15,085 cached) \u00b7 ~2.2 min to read\n\n")
+check("start line, small read has no ETA", srv.stats_start_line(120, 100), f"{M} reading 20 new tokens (100 cached)\n\n")
+end = srv.stats_end_line(114037, 111440, 2137, 24809.0, 31.5, 72.6, {"snapshots": 11, "tokens": 153019, "peak_gib": 71.8})
+check("end line", end, f"\n\n{M} 2,137 tokens at 31.5 tok/s \u00b7 read 2,597 new + 111,440 cached in 5s \u00b7 73s total \u00b7 cache 11 saved (153k tok) \u00b7 peak 71.8 GiB")
+check("strip stats", srv.strip_stats(line1 + "real reasoning" + end), "real reasoning")
+check("strip leaves normal text", srv.strip_stats("no marks here"), "no marks here")
+h2 = [{"role": "user", "content": "q1"},
+      {"role": "assistant", "content": "a1", "reasoning_content": line1 + "think A" + end},
+      {"role": "user", "content": "q2"}]
+p2 = srv.dsv4_prompt(h2, tools, True, None)
+check("stats never reach the model", M in p2, False)
+check("real reasoning kept", "think A</think>a1" in p2, True)
+h3 = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1", "reasoning_content": line1 + end}, {"role": "user", "content": "q2"}]
+check("stats-only reasoning dropped", srv.dsv4_prompt(h3, tools, True, None) == srv.dsv4_prompt(
+      [h3[0], {"role": "assistant", "content": "a1"}, h3[2]], tools, True, None), True)
+srv.PREFILL_EST[0] = 730.0; srv.update_prefill_estimate(111441, 15085, 814.0)
+check("prefill estimate learns", round(srv.PREFILL_EST[0]), round(0.7 * 730 + 0.3 * (96356 / (111441 / 814))))
 print("ALL OK" if ok else "FAILURES")
