@@ -55,6 +55,22 @@ DEFAULT_MAX_TOKENS = 8192  # Cline sends no max_tokens; 2048 cut its answers off
 THINK_MAX_TOKENS = 32768   # default when thinking: the reasoning alone can run to thousands of tokens
 DEFAULT_REASONING_EFFORT = "none"  # --default-reasoning-effort; "none" = chat mode
 THINK_END = "</think>"
+THINK_START = "<think>"
+# Reasoning budget per effort level, in tokens. When it runs out, mlx-vlm forces
+# "\n</think>" so the model must move on to its answer. Seen 2026-11-08: a Cline
+# turn reasoned for 8,488 tokens (32k chars, 4.5 min) and Cline timed out.
+THINK_BUDGETS = {"low": 1024, "medium": 2048, "high": 4096, "max": 12288, "xhigh": 12288}
+# Loop guard: stop when the last LOOP_TAIL characters already appeared LOOP_REPEATS
+# times within the last LOOP_WINDOW characters. Text-only, so every rank stops on
+# the same token. Seen 2026-11-08: a 382-token side request ran to 8,192 tokens.
+LOOP_TAIL, LOOP_REPEATS, LOOP_WINDOW, LOOP_EVERY = 200, 4, 6000, 32
+
+
+def looping(text):
+    if len(text) < LOOP_TAIL * LOOP_REPEATS:
+        return False
+    tail = text[-LOOP_TAIL:]
+    return text[-LOOP_WINDOW:].count(tail) >= LOOP_REPEATS
 # Status lines the server adds to the reasoning stream (Cline shows them in its
 # "Thinking" section). Marked so they can be stripped from history before the
 # model ever sees them. --no-stats-in-reasoning turns them off.
@@ -252,6 +268,10 @@ def run_job(model, processor, job, on_chunk, on_start=None):
     _req.clear()
     _req.update(active=use_cache, pcs=pcs, reused=0, snapshots=0, on_start=on_start)
     extra = {"prompt_cache_state": pcs} if pcs is not None else {}
+    if job.get("think") and job.get("think_budget"):
+        extra.update(thinking_budget=job["think_budget"], enable_thinking=True,
+                     thinking_start_token=THINK_START, thinking_end_token=THINK_END)
+    n_tok = 0
     try:
         for r in stream_generate(
             model,
@@ -265,17 +285,22 @@ def run_job(model, processor, job, on_chunk, on_start=None):
         ):
             last = r
             on_chunk(r)
+            # Every rank sees the same tokens, so every rank stops on the same one.
+            text += r.text
+            n_tok += 1
             if marker:
-                # Every rank sees the same tokens, so every rank stops on the same one.
                 # In thinking mode, only the answer after </think> counts.
-                text += r.text
                 tail = text[text.find(THINK_END):] if job.get("think") else text
                 if (not job.get("think") or THINK_END in text) and marker in tail:
                     break
+            if n_tok % LOOP_EVERY == 0 and looping(text):
+                job["_looped"] = True
+                break
     finally:
         if sys.exc_info()[0]:
             SNAPS.clear()  # after a failure, trust nothing
         job["_reused"] = _req.get("reused", 0)
+        job["_text"] = text
         job["_new_snaps"] = _req.get("snapshots", 0)
         _req.clear()
     return last
@@ -380,13 +405,14 @@ def reasoning_mode(body):
         effort = DEFAULT_REASONING_EFFORT
     effort = str(effort).lower()
     if effort in ("none", "minimal", "off", "false"):
-        return False, None
-    if effort not in ("low", "medium", "high", "max", "xhigh"):
+        return False, None, None
+    if effort not in THINK_BUDGETS:
         raise BadRequest(f"unsupported reasoning_effort: {effort!r}")
+    budget = int(body.get("thinking_budget") or THINK_BUDGETS[effort])
     # The vendored preview encoder knows one effort prompt, which it calls "max"
     # (the 0731 release encoder renames that text "high" and adds a stronger
     # "max"). Map the top levels onto it; everything else thinks with no prompt.
-    return True, ("max" if effort in ("max", "xhigh") else None)
+    return True, ("max" if effort in ("max", "xhigh") else None), budget
 
 
 def _strip_think(content):
@@ -465,9 +491,17 @@ def build_job(body, processor, config):
     if not isinstance(messages, list) or not messages:
         raise BadRequest("`messages` must be a non-empty list")
     if is_dsv4(config):
-        thinking, effort = reasoning_mode(body)
-        return finish_job(body, dsv4_prompt(messages, tools, thinking, effort), tools, "dsml",
-                          think=thinking)
+        thinking, effort, budget = reasoning_mode(body)
+        job = finish_job(body, dsv4_prompt(messages, tools, thinking, effort), tools, "dsml",
+                         think=thinking)
+        if budget:
+            # Leave room for the answer: a client's max_tokens can be close to the
+            # budget (Cline's ~4k cut a turn off mid-reasoning, 2026-11-08), and the
+            # budget only forces "</think>" once it is exceeded.
+            budget = max(256, min(budget, int(job["max_tokens"] * 0.75)))
+        job["think_budget"] = budget
+        job["client_max_tokens"] = body.get("max_tokens") or body.get("max_completion_tokens")
+        return job
     clean = []
     call_names = {}  # tool_call_id -> tool name, so results can be labelled
     for m in messages:
@@ -679,7 +713,9 @@ def make_handler(world, model, processor, config, model_id):
             if job["tool_open"]:
                 text, tool_calls = (parse_dsml if job["tool_format"] == "dsml" else parse_tool_call)(text)
 
-            if tool_calls:
+            if job.get("_looped"):
+                finish = "length"  # cut short; tell the client it is incomplete
+            elif tool_calls:
                 finish = "tool_calls"
             elif state["stopped"]:
                 finish = "stop"
@@ -689,12 +725,19 @@ def make_handler(world, model, processor, config, model_id):
                 finish = "stop"
             if last is not None:
                 update_prefill_estimate(last.prompt_tokens, job.get("_reused", 0), last.prompt_tps)
+                if job.get("_looped") or last.generation_tokens >= 2000:
+                    raw = job.get("_text", "")
+                    log(f"{rid}: {'LOOP stopped' if job.get('_looped') else 'long output'} after "
+                        f"{last.generation_tokens} tokens; head {raw[:200]!r} ... tail {raw[-200:]!r}")
             usage = {
                 "prompt_tokens": last.prompt_tokens if last else 0,
                 "completion_tokens": last.generation_tokens if last else 0,
                 "total_tokens": (last.prompt_tokens + last.generation_tokens) if last else 0,
             }
-            log(f"{rid}: {f'[think {len(reasoning)} chars] ' if job['think'] else ''}"
+            think_tag = (f"[think {len(reasoning)} chars, budget {job.get('think_budget')}, "
+                         f"max_tokens {job.get('client_max_tokens') or 'default'}] ") if job["think"] else ""
+            log(f"{rid}: {think_tag}"
+                f"{'[LOOP] ' if job.get('_looped') else ''}"
                 f"{'[tool ' + ', '.join(c['function']['name'] for c in tool_calls) + '] ' if tool_calls else ''}"
                 f"{usage['prompt_tokens']} prompt ({job.get('_reused', 0)} cached) + {usage['completion_tokens']} gen tokens "
                 f"in {elapsed:.1f}s (prefill {last.prompt_tps if last else 0:.0f} tok/s, "
