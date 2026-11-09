@@ -104,6 +104,15 @@ Limits:
   total time, cache state, peak GPU memory). Lines carrying the marker are
   stripped from any history a client sends back, so the model never sees them.
   `--no-stats-in-reasoning` turns them off.
+- **Recovery when a tool keeps failing** (`repeat_test.py`, offline). If the same
+  tool fails with the same error twice in a row and the client set no temperature,
+  that one turn is sampled at temperature 1.0 / top_p 0.95. Replays of a stuck edit
+  showed that at temperature 0 the model resends the failed call verbatim even when
+  told what was wrong. `--no-resample-on-repeat` turns this off. Errors are
+  recognised in OpenCode's JSON tool-result format (`{"error": ...}`).
+- **Conflicting DSML parameters.** A required parameter sent twice with different
+  values is left out of the call, so the client rejects it and the model retries;
+  no value is guessed. A conflict on an optional parameter still fails parsing.
 - **Warm-up before serving.** All ranks run a tiny generation after loading (about
   7 s; a normal tiny request takes 0.3 s). Without it, a request arriving the
   moment the server came up crashed both ranks with a Metal GPU timeout.

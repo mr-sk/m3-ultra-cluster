@@ -548,7 +548,38 @@ def _drop_identical_duplicates(body):
     return "".join(parts)
 
 
-def parse_dsml(text):
+def _drop_conflicting_required(body, tools):
+    """Leave out a required parameter that was sent twice with different values.
+
+    Sampled replays of a stuck edit sometimes sent two different `newString`s
+    (2026-11-09). The parser rejects that, so the call reached the client as
+    plain text and ended the task. Without the parameter the call fails the
+    client's validation and the model retries, with no value guessed. Optional
+    parameters are left alone: a call missing one would run.
+    """
+    required = {}
+    for t in tools or []:
+        f = t.get("function", t)
+        required[f.get("name")] = set((f.get("parameters") or {}).get("required") or [])
+    dropped = []
+    parts = re.split(r"(?=<｜DSML｜invoke)", body)
+    for i, part in enumerate(parts):
+        invoke = re.match(r'<｜DSML｜invoke name="([^"]*)"', part)
+        values = {}
+        for name, _, value in _DSML_PARAM.findall(part):
+            values.setdefault(name, set()).add(value)
+        conflicts = {k for k, v in values.items() if len(v) > 1}
+        conflicts &= required.get(invoke.group(1), set()) if invoke else set()
+        if conflicts:
+            dropped += sorted(conflicts)
+            parts[i] = _DSML_PARAM.sub(
+                lambda m: "" if m.group(1) in conflicts else m.group(0), part)
+    if dropped:
+        log(f"DSML: left out required parameters sent with conflicting values {dropped}")
+    return "".join(parts)
+
+
+def parse_dsml(text, tools=None):
     """Return (content before the calls, [openai tool_call, ...]) or (text, [])."""
     i = text.find(DSML_OPEN)
     if i == -1:
@@ -557,6 +588,7 @@ def parse_dsml(text):
     j = body.find(DSML_STOP)
     # Generation stops on the closing tag's stem, so put the full tag back.
     body = _drop_identical_duplicates((body[:j] if j != -1 else body) + DSML_END)
+    body = _drop_conflicting_required(body, tools)
     _dsml_fixups.clear()
     try:
         _, _, calls = dsv4_encoding.parse_tool_calls(0, body)
@@ -890,7 +922,8 @@ def make_handler(world, model, processor, config, model_id):
             text, _ = apply_stop(src, stops)
             tool_calls = []
             if job["tool_open"]:
-                text, tool_calls = (parse_dsml if job["tool_format"] == "dsml" else parse_tool_call)(text)
+                text, tool_calls = (parse_dsml(text, body.get("tools")) if job["tool_format"] == "dsml"
+                                    else parse_tool_call(text))
                 if tool_calls:
                     check_required(tool_calls, body.get("tools"), state["text"])
 

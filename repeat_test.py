@@ -92,6 +92,56 @@ def test_can_be_disabled():
         m.RESAMPLE_ON_REPEAT = True
 
 
+P = '<｜DSML｜parameter name="%s" string="true">%s</｜DSML｜parameter>\n'
+EDIT_TOOL = {"type": "function", "function": {"name": "edit", "parameters": {
+    "properties": {"path": {}, "oldString": {}, "newString": {}, "replaceAll": {}},
+    "required": ["path", "oldString", "newString"]}}}
+
+
+def dsml(*invokes):
+    out = "<｜DSML｜tool_calls>\n"
+    for name, params in invokes:
+        out += f'<｜DSML｜invoke name="{name}">\n' + "".join(P % kv for kv in params) + "</｜DSML｜invoke>\n"
+    return out + "</｜DSML｜tool_calls"
+
+
+BASE = [("path", "a.swift"), ("oldString", "x")]
+
+
+def args(call):
+    return json.loads(call["function"]["arguments"])
+
+
+def test_conflicting_required_param_is_left_out():
+    text = dsml(("edit", BASE + [("newString", "one"), ("newString", "two")]))
+    _, calls = m.parse_dsml(text, [EDIT_TOOL])
+    assert args(calls[0]) == {"path": "a.swift", "oldString": "x"}
+
+def test_identical_duplicate_still_collapses():
+    text = dsml(("edit", BASE + [("newString", "one"), ("newString", "one")]))
+    _, calls = m.parse_dsml(text, [EDIT_TOOL])
+    assert args(calls[0])["newString"] == "one"
+
+def test_conflicting_optional_param_stays_plain_text():
+    text = dsml(("edit", BASE + [("newString", "n"), ("replaceAll", "a"), ("replaceAll", "b")]))
+    assert m.parse_dsml(text, [EDIT_TOOL])[1] == []
+
+def test_conflict_without_tool_schema_stays_plain_text():
+    text = dsml(("edit", BASE + [("newString", "one"), ("newString", "two")]))
+    assert m.parse_dsml(text, None)[1] == []
+
+def test_conflict_on_unknown_tool_stays_plain_text():
+    text = dsml(("mystery", BASE + [("newString", "one"), ("newString", "two")]))
+    assert m.parse_dsml(text, [EDIT_TOOL])[1] == []
+
+def test_only_the_conflicting_call_loses_the_param():
+    good = BASE + [("newString", "fine")]
+    bad_call = BASE + [("newString", "one"), ("newString", "two")]
+    _, calls = m.parse_dsml(dsml(("edit", good), ("edit", bad_call)), [EDIT_TOOL])
+    assert args(calls[0])["newString"] == "fine"
+    assert "newString" not in args(calls[1])
+
+
 bad = 0
 tests = [(k, v) for k, v in list(globals().items()) if k.startswith("test_")]
 for name, fn in tests:
