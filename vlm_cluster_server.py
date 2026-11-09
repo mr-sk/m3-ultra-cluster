@@ -631,6 +631,41 @@ def build_job(body, processor, config):
     return finish_job(body, prompt, tools, "json")
 
 
+# Greedy decoding resends a failed call verbatim, even when told exactly what was
+# wrong (replays of Test B's stuck turn, 2026-11-09); sampling is what breaks it.
+RESAMPLE_ON_REPEAT = True  # --no-resample-on-repeat
+REPEAT_STREAK = 2          # same tool, same error, this many times in a row
+
+
+def _tool_error(content):
+    """The error in a tool result, as a comparable string, or None if it has none."""
+    try:
+        result = json.loads(flatten_content(content))
+    except (TypeError, ValueError):
+        return None
+    error = result.get("error") if isinstance(result, dict) else None
+    return json.dumps(error, sort_keys=True) if error else None
+
+
+def failure_streak(messages):
+    """How many of the latest tool results are the same tool failing the same way.
+
+    Only tool results count: other messages between them neither add to the
+    streak nor end it.
+    """
+    names, streak, last = {}, 0, None
+    for m in messages:
+        for call in m.get("tool_calls") or []:
+            names[call.get("id")] = (call.get("function") or {}).get("name")
+        if m.get("role") not in ("tool", "function"):
+            continue
+        error = _tool_error(m.get("content"))
+        key = (names.get(m.get("tool_call_id")), error) if error else None
+        streak = 0 if key is None else streak + 1 if key == last else 1
+        last = key
+    return streak
+
+
 def finish_job(body, prompt, tools, tool_format, think=False):
     temperature, top_p = body.get("temperature"), body.get("top_p")
     client_max = body.get("max_tokens") or body.get("max_completion_tokens")
@@ -642,6 +677,11 @@ def finish_job(body, prompt, tools, tool_format, think=False):
         # Greedy decoding tends to loop in long reasoning.
         temperature = 1.0 if temperature is None else temperature
         top_p = (0.95 if tools else 1.0) if top_p is None else top_p
+    streak = failure_streak(body.get("messages") or []) if RESAMPLE_ON_REPEAT else 0
+    if streak >= REPEAT_STREAK and temperature is None:
+        temperature, sources["temperature"] = 1.0, "repeat"
+        top_p = 0.95 if top_p is None else top_p
+        log(f"tool failed the same way {streak} times in a row: sampling this turn")
     return {
         "prompt": prompt,
         "think": think,
@@ -655,6 +695,7 @@ def finish_job(body, prompt, tools, tool_format, think=False):
         "stop_marker": (DSML_STOP if tool_format == "dsml" else TOOL_STOP) if tools else None,
         "cache": body.get("cache", True) is not False,  # {"cache": false} forces a cold read
         "param_source": sources,
+        "repeat_streak": streak,
     }
 
 
@@ -930,7 +971,7 @@ def make_handler(world, model, processor, config, model_id):
 
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
-    global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR
+    global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -939,6 +980,8 @@ def main():
     ap.add_argument("--no-prompt-cache", action="store_true")
     ap.add_argument("--trace-dir", default=TRACE_DIR, help="where rank 0 saves request/response traces")
     ap.add_argument("--no-trace", action="store_true", help="don't save traces")
+    ap.add_argument("--no-resample-on-repeat", action="store_true",
+                    help="stay greedy even when a tool keeps failing the same way")
     ap.add_argument("--no-stats-in-reasoning", action="store_true",
                     help="don't add the server's status lines to the streamed reasoning")
     ap.add_argument("--default-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
@@ -953,6 +996,7 @@ def main():
     TRACE_DIR = "" if args.no_trace else os.path.expanduser(args.trace_dir)
     DEFAULT_REASONING_EFFORT = args.default_reasoning_effort
     STATS_IN_REASONING = not args.no_stats_in_reasoning
+    RESAMPLE_ON_REPEAT = not args.no_resample_on_repeat
     CACHE_MAX_SNAPS = args.cache_max_snapshots
     CACHE_BUDGET_TOKENS = args.cache_budget_tokens
     CACHE_CKPT_GAP = args.cache_checkpoint_gap
