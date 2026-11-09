@@ -72,6 +72,16 @@ calls = [{"id": "c", "type": "function", "function": {"name": "editor", "argumen
 srv.check_required(calls, etools, "raw")
 a2 = __import__("json").loads(calls[0]["function"]["arguments"])
 check("missing required args are NOT filled", "new_text" in a2, False)
+P = lambda n, v: f'<{D}parameter name="{n}" string="true">{v}</{D}parameter>\n'
+call = lambda params: f'\n\n<{D}tool_calls>\n<{D}invoke name="edit">\n' + "".join(params) + f'</{D}invoke>\n</{D}tool_calls>'
+_, c1 = srv.parse_dsml("x" + call([P("path", "a.swift"), P("old", "1"), P("new", "2"), P("path", "a.swift")]))
+a1 = __import__("json").loads(c1[0]["function"]["arguments"]) if c1 else {}
+check("identical duplicate kept once", a1, {"path": "a.swift", "old": "1", "new": "2"})
+_, c2 = srv.parse_dsml("x" + call([P("path", "a.swift"), P("old", "1"), P("path", "b.swift")]))
+check("conflicting duplicate still rejected", c2, [])
+two = f'\n\n<{D}tool_calls>\n<{D}invoke name="a">\n' + P("path", "x") + f'</{D}invoke>\n<{D}invoke name="b">\n' + P("path", "x") + f'</{D}invoke>\n</{D}tool_calls>'
+_, c3 = srv.parse_dsml("x" + two)
+check("same name in separate invokes untouched", [(x["function"]["name"], x["function"]["arguments"]) for x in c3], [("a", '{"path": "x"}'), ("b", '{"path": "x"}')])
 M = srv.STATS_MARK
 line1 = srv.stats_start_line(111441, 15085)
 check("start line", line1, f"{M} reading 96,356 new tokens (15,085 cached) \u00b7 ~2.2 min to read\n\n")

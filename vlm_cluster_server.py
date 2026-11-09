@@ -516,6 +516,38 @@ def check_required(tool_calls, tools, raw=""):
     return tool_calls
 
 
+_DSML_PARAM = re.compile(
+    r'<｜DSML｜parameter name="([^"]*)" string="(true|false)">(.*?)</｜DSML｜parameter>\n?', re.S)
+
+
+def _drop_identical_duplicates(body):
+    """Remove repeats of a parameter that has the SAME value within one invoke.
+
+    After being told it missed `path`, DeepSeek sent `path` twice with the same
+    value (2026-11-08). The reference parser rejects any duplicate, so a complete
+    edit reached the client as plain text and ended the task. Repeats with a
+    DIFFERENT value are left in place: the parser still rejects those, because
+    choosing between them would be a guess.
+    """
+    removed = []
+    parts = re.split(r"(?=<｜DSML｜invoke)", body)
+    for i, part in enumerate(parts):
+        seen = {}
+
+        def keep_first(m):
+            name, value = m.group(1), (m.group(2), m.group(3))
+            if seen.get(name) == value:
+                removed.append(name)
+                return ""
+            seen.setdefault(name, value)
+            return m.group(0)
+
+        parts[i] = _DSML_PARAM.sub(keep_first, part)
+    if removed:
+        log(f"DSML: dropped identical duplicate parameters {removed}")
+    return "".join(parts)
+
+
 def parse_dsml(text):
     """Return (content before the calls, [openai tool_call, ...]) or (text, [])."""
     i = text.find(DSML_OPEN)
@@ -524,7 +556,7 @@ def parse_dsml(text):
     body = text[i + len(DSML_OPEN):]
     j = body.find(DSML_STOP)
     # Generation stops on the closing tag's stem, so put the full tag back.
-    body = (body[:j] if j != -1 else body) + DSML_END
+    body = _drop_identical_duplicates((body[:j] if j != -1 else body) + DSML_END)
     _dsml_fixups.clear()
     try:
         _, _, calls = dsv4_encoding.parse_tool_calls(0, body)
