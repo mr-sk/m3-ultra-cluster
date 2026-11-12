@@ -116,6 +116,16 @@ Limits:
 - **Warm-up before serving.** All ranks run a tiny generation after loading (about
   7 s; a normal tiny request takes 0.3 s). Without it, a request arriving the
   moment the server came up crashed both ranks with a Metal GPU timeout.
+- **Paging the weights back in after idle** (`prefault_test.py`, offline). macOS
+  unwires idle GPU memory within seconds, even with `mx.set_wired_limit` raised
+  (60 GiB measured unwired after ~15 s idle), and may then compress or swap it.
+  The first request after a long idle (12 h, then ~2 days) paged the weights back
+  in inside GPU work while the other rank's GPU waited, and the ~5 s GPU watchdog
+  killed rank 1. Now, after `--prefault-idle` seconds without a job (default 60;
+  0 = every job, negative = never), each rank touches its weights one tensor per
+  command buffer and the ranks meet at a CPU barrier before any cross-rank GPU
+  work. The warm-up does the same. Log: `paged in N weight tensors in Xs, then
+  waited Ys for the other ranks`.
 - Default `max_tokens` is 8192. Cline sends none, and the old 2048 default cut
   an answer off at exactly 2048 tokens.
 - Server log: `~/dsv4-server.log` on purple. (`~/vlm-server.log` there is a stale

@@ -258,8 +258,54 @@ def broadcast(world, obj=None):
     return json.loads(np.array(buf).astype(np.uint8).tobytes().decode())
 
 
+# Page the weights back in after an idle gap. macOS unwires idle GPU memory
+# within seconds (even with mx.set_wired_limit raised; measured on macOS 27.2)
+# and may then compress or swap it. The first job after a long idle used to page
+# it back in inside GPU work while the other rank's GPU waited on this one, and
+# the ~5 s GPU watchdog killed rank 1 (kIOGPUCommandBufferCallbackErrorTimeout,
+# 2026-11-09 after 12 h idle, 2026-11-11 after ~2 days). Rank 0 decides and sends
+# the decision with the job, so every rank does the same thing.
+PREFAULT_IDLE = 60.0  # seconds idle before a job prefaults; 0 = every job, <0 = never
+LAST_JOB_END = None   # time.monotonic() when the last job finished (rank 0 decides)
+WORLD = None
+
+
+def needs_prefault(now, last_end, idle=None):
+    idle = PREFAULT_IDLE if idle is None else idle
+    if idle < 0:
+        return False
+    return last_end is None or now - last_end >= idle
+
+
+def cpu_barrier():
+    """Wait for every rank on the CPU, where the GPU watchdog cannot see the wait."""
+    if WORLD is not None and WORLD.size() > 1:
+        mx.eval(mx.distributed.all_sum(mx.array([1]), group=WORLD, stream=mx.cpu))
+
+
+def prefault(model, barrier=None):
+    """Touch every weight on this rank, one tensor per GPU command buffer, so no
+    single buffer has to page in more than one tensor. Then wait for the other
+    ranks, so no rank's GPU sits waiting on a rank that is still paging in.
+    Returns (tensors touched, seconds touching, seconds waiting for the others)."""
+    from mlx.utils import tree_flatten
+    t = time.perf_counter()
+    params = tree_flatten(model.parameters())
+    for _, p in params:
+        mx.eval(p.sum())
+    touched = time.perf_counter()
+    if barrier is not None:
+        barrier()
+    return len(params), touched - t, time.perf_counter() - touched
+
+
 def run_job(model, processor, job, on_chunk, on_start=None):
     """Generate for one job. Runs identically on every rank."""
+    global LAST_JOB_END
+    if job.get("prefault"):
+        n, dt, waited = prefault(model, cpu_barrier)
+        log(f"rank {WORLD.rank() if WORLD else 0}: paged in {n} weight tensors in {dt:.1f}s, "
+            f"then waited {waited:.1f}s for the other ranks")
     mx.random.seed(job["seed"])  # same seed everywhere, so sampled tokens match
     last = None
     marker = job.get("stop_marker")
@@ -303,6 +349,7 @@ def run_job(model, processor, job, on_chunk, on_start=None):
         job["_text"] = text
         job["_new_snaps"] = _req.get("snapshots", 0)
         _req.clear()
+        LAST_JOB_END = time.monotonic()
     return last
 
 
@@ -843,6 +890,7 @@ def make_handler(world, model, processor, config, model_id):
             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 
+            job["prefault"] = needs_prefault(time.monotonic(), LAST_JOB_END)
             broadcast(world, job)  # every rank now starts the same job
 
             state = {"text": "", "sent": 0, "rsent": 0, "stopped": False, "client_gone": False}
@@ -1005,6 +1053,7 @@ def make_handler(world, model, processor, config, model_id):
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
     global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
+    global PREFAULT_IDLE, WORLD
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -1015,6 +1064,9 @@ def main():
     ap.add_argument("--no-trace", action="store_true", help="don't save traces")
     ap.add_argument("--no-resample-on-repeat", action="store_true",
                     help="stay greedy even when a tool keeps failing the same way")
+    ap.add_argument("--prefault-idle", type=float, default=PREFAULT_IDLE,
+                    help="seconds idle after which a job first pages the weights back in "
+                         "(0 = before every job, negative = never)")
     ap.add_argument("--no-stats-in-reasoning", action="store_true",
                     help="don't add the server's status lines to the streamed reasoning")
     ap.add_argument("--default-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
@@ -1030,11 +1082,12 @@ def main():
     DEFAULT_REASONING_EFFORT = args.default_reasoning_effort
     STATS_IN_REASONING = not args.no_stats_in_reasoning
     RESAMPLE_ON_REPEAT = not args.no_resample_on_repeat
+    PREFAULT_IDLE = args.prefault_idle
     CACHE_MAX_SNAPS = args.cache_max_snapshots
     CACHE_BUDGET_TOKENS = args.cache_budget_tokens
     CACHE_CKPT_GAP = args.cache_checkpoint_gap
 
-    world = mx.distributed.init()
+    world = WORLD = mx.distributed.init()
     rank = world.rank()
     t0 = time.perf_counter()
     if world.size() > 1:
@@ -1060,8 +1113,10 @@ def main():
     t1 = time.perf_counter()
     # One attempt only: a GPU timeout can leave the ranks out of step, so fail
     # loudly at startup rather than retry.
+    # Page in first: the ranks finish loading at different times.
     run_job(model, processor, {"prompt": "Hello", "max_tokens": 4, "temperature": 0.0,
-                               "top_p": 1.0, "seed": 0, "cache": False}, lambda r: None)
+                               "top_p": 1.0, "seed": 0, "cache": False,
+                               "prefault": PREFAULT_IDLE >= 0}, lambda r: None)
     log(f"rank {rank}: warm-up done in {time.perf_counter() - t1:.1f}s")
 
     if rank != 0:
