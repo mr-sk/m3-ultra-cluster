@@ -116,6 +116,14 @@ Limits:
 - **Warm-up before serving.** All ranks run a tiny generation after loading (about
   7 s; a normal tiny request takes 0.3 s). Without it, a request arriving the
   moment the server came up crashed both ranks with a Metal GPU timeout.
+- **Keeping the weights wired** (`pin_test.py`, offline). macOS drops GPU
+  residency after ~2 s idle (a macOS bug, ml-explore/mlx#4633). The server sets
+  `MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS=1000` before importing MLX (set it
+  yourself to override) and holds the wired limit raised for its whole life,
+  because mlx-vlm's `stream_generate` sets it back to 0 after every call, and at
+  0 the refresh has nothing to keep. Measured: ~75 GiB per node stayed wired
+  through 150 s idle, and the first request after idle took 0.49 s (5.3 s
+  before). `--no-pin-weights` turns the held limit off.
 - **Paging the weights back in after idle** (`prefault_test.py`, offline). macOS
   unwires idle GPU memory within seconds, even with `mx.set_wired_limit` raised
   (60 GiB measured unwired after ~15 s idle), and may then compress or swap it.

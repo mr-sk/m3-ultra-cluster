@@ -31,6 +31,7 @@ Limits, on purpose:
     re-reading it. Anything else is read from scratch.
 """
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -40,6 +41,12 @@ import sys
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# macOS drops GPU residency after ~2 s idle (a macOS bug; ml-explore/mlx#4633).
+# This makes MLX re-request it every second. MLX reads it when it creates the
+# Metal device, so it is set before mlx is imported. It only covers memory inside
+# the wired limit, which pin_weights() holds raised. Set it yourself to override.
+os.environ.setdefault("MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS", "1000")
 
 import mlx.core as mx
 import dsv4_encoding  # DeepSeek's reference DeepSeek-V4 encoder, vendored (MIT)
@@ -258,8 +265,9 @@ def broadcast(world, obj=None):
     return json.loads(np.array(buf).astype(np.uint8).tobytes().decode())
 
 
-# Page the weights back in after an idle gap. macOS unwires idle GPU memory
-# within seconds (even with mx.set_wired_limit raised; measured on macOS 27.2)
+# Page the weights back in after an idle gap: a backstop for pin_weights().
+# macOS unwires idle GPU memory within seconds (even with mx.set_wired_limit
+# raised, unless MLX's residency refresh is on; measured on macOS 27.2)
 # and may then compress or swap it. The first job after a long idle used to page
 # it back in inside GPU work while the other rank's GPU waited on this one, and
 # the ~5 s GPU watchdog killed rank 1 (kIOGPUCommandBufferCallbackErrorTimeout,
@@ -1050,10 +1058,41 @@ def make_handler(world, model, processor, config, model_id):
     return Handler
 
 
+PIN_WEIGHTS = True  # --no-pin-weights
+STOCK_WIRED_LIMIT = importlib.import_module("mlx_vlm.generate.common").wired_limit
+
+
+@contextlib.contextmanager
+def _keep_wired(model, streams=None):
+    """Stand-in for mlx-vlm's wired_limit once the weights are pinned: leave the limit alone."""
+    yield
+
+
+def pin_weights():
+    """Hold the wired limit raised for the life of the server.
+
+    mlx-vlm's stream_generate raises the limit for each call and sets it back to
+    the old value (0) afterwards. At 0, MLX's residency refresh has nothing to
+    keep, so idle weights get unwired and may be compressed or swapped. Measured
+    on an M3 Ultra (macOS 27.2.1, 60 GiB): with the refresh on and the limit
+    held, 65 GiB stayed wired through 60 s idle and the next pass took 0.11 s;
+    with the limit back at 0, 4.9 GiB stayed wired and the pass took 0.58 s.
+    mlx-lm's server does the same thing (raises the limit once at startup).
+    Returns the limit in bytes.
+    """
+    limit = mx.device_info()["max_recommended_working_set_size"]
+    mx.set_wired_limit(limit)
+    # Several mlx_vlm modules import wired_limit by name; replace every copy.
+    for name, mod in list(sys.modules.items()):
+        if name.startswith("mlx_vlm") and getattr(mod, "wired_limit", None) is STOCK_WIRED_LIMIT:
+            mod.wired_limit = _keep_wired
+    return limit
+
+
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
     global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
-    global PREFAULT_IDLE, WORLD
+    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -1064,6 +1103,8 @@ def main():
     ap.add_argument("--no-trace", action="store_true", help="don't save traces")
     ap.add_argument("--no-resample-on-repeat", action="store_true",
                     help="stay greedy even when a tool keeps failing the same way")
+    ap.add_argument("--no-pin-weights", action="store_true",
+                    help="let mlx-vlm lower the wired limit after each request (its default)")
     ap.add_argument("--prefault-idle", type=float, default=PREFAULT_IDLE,
                     help="seconds idle after which a job first pages the weights back in "
                          "(0 = before every job, negative = never)")
@@ -1083,6 +1124,7 @@ def main():
     STATS_IN_REASONING = not args.no_stats_in_reasoning
     RESAMPLE_ON_REPEAT = not args.no_resample_on_repeat
     PREFAULT_IDLE = args.prefault_idle
+    PIN_WEIGHTS = not args.no_pin_weights
     CACHE_MAX_SNAPS = args.cache_max_snapshots
     CACHE_BUDGET_TOKENS = args.cache_budget_tokens
     CACHE_CKPT_GAP = args.cache_checkpoint_gap
@@ -1105,6 +1147,9 @@ def main():
         f"{CACHE_BUDGET_TOKENS} token budget, checkpoint ids {sorted(BOUNDARY_IDS)}")
     log(f"rank {rank}/{world.size()}: loaded {args.model} in {time.perf_counter() - t0:.0f}s, "
         f"{mx.get_active_memory() / 2**30:.1f} GiB active")
+    if PIN_WEIGHTS:
+        log(f"rank {rank}: wired limit held at {pin_weights() / 2**30:.1f} GiB, residency refresh "
+            f"every {os.environ.get('MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS')} ms")
 
     # Warm up before serving: the first pass compiles kernels and touches every
     # weight. In pipeline mode rank 0's GPU work waits on the other ranks, so a
