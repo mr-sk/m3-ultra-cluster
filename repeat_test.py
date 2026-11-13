@@ -142,6 +142,29 @@ def test_only_the_conflicting_call_loses_the_param():
     assert "newString" not in args(calls[1])
 
 
+WRITE_TOOL = {"type": "function", "function": {"name": "write", "parameters": {
+    "properties": {"path": {}, "content": {}}, "required": ["path", "content"]}}}
+
+
+def test_conflicting_param_outside_the_schema_is_left_out():
+    # B7, 2026-11-13: a complete `write` with two different `oldString`s
+    # attached (an `edit` parameter). The whole call reached the client as text.
+    text = dsml(("write", [("path", "a.swift"), ("content", "all of it"),
+                           ("oldString", "one"), ("oldString", "two")]))
+    _, calls = m.parse_dsml(text, [EDIT_TOOL, WRITE_TOOL])
+    assert calls and args(calls[0]) == {"path": "a.swift", "content": "all of it"}, calls
+
+def test_conflict_outside_schema_needs_a_schema():
+    text = dsml(("write", [("path", "a.swift"), ("content", "c"),
+                           ("oldString", "one"), ("oldString", "two")]))
+    assert m.parse_dsml(text, None)[1] == []
+
+def test_known_optional_conflict_still_plain_text_with_unknown_dropped():
+    text = dsml(("edit", BASE + [("newString", "n"), ("replaceAll", "a"), ("replaceAll", "b"),
+                                 ("content", "p"), ("content", "q")]))
+    assert m.parse_dsml(text, [EDIT_TOOL])[1] == []
+
+
 bad = 0
 tests = [(k, v) for k, v in list(globals().items()) if k.startswith("test_")]
 for name, fn in tests:

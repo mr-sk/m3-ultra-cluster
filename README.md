@@ -122,7 +122,11 @@ Limits:
   recognised in OpenCode's JSON tool-result format (`{"error": ...}`).
 - **Conflicting DSML parameters.** A required parameter sent twice with different
   values is left out of the call, so the client rejects it and the model retries;
-  no value is guessed. A conflict on an optional parameter still fails parsing.
+  no value is guessed. So is one the tool's schema doesn't list at all (B7: a
+  complete `write` carried two different `oldString`s, an `edit` parameter, and
+  went to the client as text, ending the session); the tool doesn't take it, so
+  nothing is lost. A conflict on an optional parameter the tool does take still
+  fails parsing.
 - **Warm-up before serving.** All ranks run a tiny generation after loading (about
   7 s; a normal tiny request takes 0.3 s). Without it, a request arriving the
   moment the server came up crashed both ranks with a Metal GPU timeout.

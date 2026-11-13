@@ -702,11 +702,20 @@ def _drop_conflicting_required(body, tools):
     plain text and ended the task. Without the parameter the call fails the
     client's validation and the model retries, with no value guessed. Optional
     parameters are left alone: a call missing one would run.
+
+    A parameter the tool's schema does not list is left out too: the tool
+    does not take it, so nothing is lost. In B7 (2026-11-13) a complete `write`
+    (path + content) carried two different `oldString`s, an `edit` parameter,
+    and the whole call reached the client as text, ending the session.
     """
     required = {}
     for t in tools or []:
         f = t.get("function", t)
-        required[f.get("name")] = set((f.get("parameters") or {}).get("required") or [])
+        params = f.get("parameters") or {}
+        props = params.get("properties")
+        req = set(params.get("required") or [])
+        # Unknown names are dropped only when the schema lists its properties.
+        required[f.get("name")] = (req, set(props) if isinstance(props, dict) else None)
     dropped = []
     parts = re.split(r"(?=<｜DSML｜invoke)", body)
     for i, part in enumerate(parts):
@@ -715,13 +724,14 @@ def _drop_conflicting_required(body, tools):
         for name, _, value in _DSML_PARAM.findall(part):
             values.setdefault(name, set()).add(value)
         conflicts = {k for k, v in values.items() if len(v) > 1}
-        conflicts &= required.get(invoke.group(1), set()) if invoke else set()
+        req, known = required.get(invoke.group(1), (set(), None)) if invoke else (set(), None)
+        conflicts = {k for k in conflicts if k in req or (known is not None and k not in known)}
         if conflicts:
             dropped += sorted(conflicts)
             parts[i] = _DSML_PARAM.sub(
                 lambda m: "" if m.group(1) in conflicts else m.group(0), part)
     if dropped:
-        log(f"DSML: left out required parameters sent with conflicting values {dropped}")
+        log(f"DSML: left out required or unknown parameters sent with conflicting values {dropped}")
     return "".join(parts)
 
 
