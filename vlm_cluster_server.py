@@ -37,6 +37,7 @@ import json
 import os
 import random
 import re
+import socket
 import sys
 import time
 import uuid
@@ -254,6 +255,12 @@ def broadcast(world, obj=None):
     """
     if world.size() == 1:
         return obj
+    if WAKE is not None:
+        if world.rank() == 0:
+            WAKE.signal()
+        elif not WAKE.wait():
+            log(f"rank {world.rank()}: rank 0 closed the wake socket, shutting down")
+            return {"cmd": "shutdown"}
     data = json.dumps(obj).encode() if world.rank() == 0 else b""
     n = mx.distributed.all_sum(mx.array([len(data)], dtype=mx.int32), group=world, stream=mx.cpu)
     n = int(n.item())
@@ -263,6 +270,90 @@ def broadcast(world, obj=None):
         buf = mx.zeros((n,), dtype=mx.int32)
     buf = mx.distributed.all_sum(buf, group=world, stream=mx.cpu)
     return json.loads(np.array(buf).astype(np.uint8).tobytes().decode())
+
+
+# Wake socket: lets the other ranks wait for a job without spinning a core.
+# broadcast() is a CPU all_sum, and JACCL waits for one by polling the
+# Thunderbolt RDMA completion queue, so a rank waiting for the next job held
+# one core at 100% for as long as the server was idle (seen 2026-11-13). Rank 0
+# now sends one byte over TCP before each broadcast; the others block on it,
+# at no CPU, and only then enter the all_sum. If rank 0 dies, they see the
+# socket close and shut down instead of polling forever.
+WAKE = None
+WAKE_PORT = 8095
+WAKE_HELLO = b"dsv4-wake\n"
+
+
+def wake_address(env, port):
+    """(rank 0's host, port), from the coordinator address mlx.launch sets."""
+    coord = env.get("MLX_JACCL_COORDINATOR")
+    if not coord:
+        return None
+    return coord.rsplit(":", 1)[0], port
+
+
+class Wake:
+    def __init__(self, socks):
+        self.socks = socks
+
+    @staticmethod
+    def _tune(s):
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        s.settimeout(None)
+        return s
+
+    @classmethod
+    def listen(cls, port, n, host="0.0.0.0", timeout=600):
+        """Rank 0: accept n workers. Connections without the hello are dropped."""
+        srv = socket.create_server((host, port))
+        srv.settimeout(timeout)
+        socks = []
+        try:
+            while len(socks) < n:
+                s, _ = srv.accept()
+                s.settimeout(5)
+                try:
+                    hello = s.recv(len(WAKE_HELLO))
+                except OSError:
+                    hello = b""
+                if hello == WAKE_HELLO:
+                    socks.append(cls._tune(s))
+                else:
+                    s.close()
+        finally:
+            srv.close()
+        return cls(socks)
+
+    @classmethod
+    def connect(cls, host, port, rank, timeout=600):
+        """A worker: connect to rank 0, retrying until it is listening."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                s = socket.create_connection((host, port), timeout=5)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.5)
+        s.sendall(WAKE_HELLO)
+        return cls([cls._tune(s)])
+
+    def signal(self):
+        for s in self.socks:
+            s.sendall(b"j")
+
+    def wait(self):
+        """Block until rank 0 signals (True) or closes the socket (False)."""
+        try:
+            return self.socks[0].recv(1) == b"j"
+        except OSError:
+            return False
+
+    def close(self):
+        for s in self.socks:
+            s.close()
 
 
 # Page the weights back in after an idle gap: a backstop for pin_weights().
@@ -1092,7 +1183,7 @@ def pin_weights():
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
     global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
-    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS
+    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -1113,6 +1204,10 @@ def main():
     ap.add_argument("--default-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
                     choices=["none", "low", "medium", "high", "max"],
                     help="thinking mode for requests that don't ask (DeepSeek-V4 only)")
+    ap.add_argument("--wake-port", type=int, default=WAKE_PORT,
+                    help="TCP port on rank 0 that wakes the other ranks for each job")
+    ap.add_argument("--no-wake", action="store_true",
+                    help="wait for jobs inside the all_sum instead (spins a core per waiting rank)")
     ap.add_argument("--cache-max-snapshots", type=int, default=CACHE_MAX_SNAPS)
     ap.add_argument("--cache-budget-tokens", type=int, default=CACHE_BUDGET_TOKENS)
     ap.add_argument("--cache-checkpoint-gap", type=int, default=CACHE_CKPT_GAP)
@@ -1150,6 +1245,15 @@ def main():
     if PIN_WEIGHTS:
         log(f"rank {rank}: wired limit held at {pin_weights() / 2**30:.1f} GiB, residency refresh "
             f"every {os.environ.get('MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS')} ms")
+    addr = wake_address(os.environ, args.wake_port)
+    if world.size() > 1 and not args.no_wake and addr is not None:
+        if rank == 0:
+            WAKE = Wake.listen(addr[1], world.size() - 1, host=addr[0])
+        else:
+            WAKE = Wake.connect(addr[0], addr[1], rank)
+        log(f"rank {rank}: wake socket up on port {addr[1]}")
+    elif world.size() > 1:
+        log(f"rank {rank}: no wake socket; waiting ranks will spin a core")
 
     # Warm up before serving: the first pass compiles kernels and touches every
     # weight. In pipeline mode rank 0's GPU work waits on the other ranks, so a

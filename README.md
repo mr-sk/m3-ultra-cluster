@@ -38,6 +38,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | Script | Venv | What it does |
 |---|---|---|
 | `vlm_cluster_server.py` | `~/vlm-env` | OpenAI-compatible chat server for an mlx-vlm model split across both nodes |
+| `cluster_launch.py` | `~/cluster-env` | `mlx.launch` with its IO loop fixed so it doesn't spin ~1.7 cores while the job runs |
 | `needle_test.py` | `~/cluster-env` | Needle-in-a-haystack correctness test, Qwen3-Coder-Next via mlx-lm |
 | `dsv4_run.py` | `~/vlm-env` | Speed sweep + needle test for DeepSeek-V4-Flash via mlx-vlm |
 
@@ -52,7 +53,7 @@ its own server cannot. Rank 0 serves HTTP and hands each request to the other
 node over `mx.distributed`; both generate in lockstep.
 
 ```bash
-nohup ~/cluster-env/bin/mlx.launch --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
+nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
   $HOME/vlm-env/bin/python $HOME/vlm_cluster_server.py \
   --model mlx-community/DeepSeek-V4-Flash-4bit --port 8090 > ~/vlm-server.log 2>&1 &
 
@@ -67,8 +68,17 @@ model      mlx-community/DeepSeek-V4-Flash-4bit
 API key    anything
 ```
 
+`cluster_launch.py` takes the same arguments as `mlx.launch` (`launch_test.py`,
+offline). Stock `mlx.launch` (mlx 0.32.4) never sleeps in its IO loop: each
+rank's thread selects on the child's stdin as writable even with nothing to
+write, and the main loop selects on its own stdin, which under `nohup` is at EOF
+and always readable. Measured ~1.7 cores on purple for the server's whole life.
+`cluster_launch.py` runs `mlx.launch` with a copy of that loop with both waits
+fixed (test: 0.006 s of CPU over 2 s idle, against 3.6 s for stock). It only
+patches mlx 0.32.4; on another version it warns and runs the stock loop.
+
 Stop it: `pkill -f vlm_cluster_server.py` on purple (orange's half exits with
-it; if not, run the same on orange).
+it, through the wake socket below; if not, run the same on orange).
 
 Limits:
 
@@ -134,6 +144,14 @@ Limits:
   command buffer and the ranks meet at a CPU barrier before any cross-rank GPU
   work. The warm-up does the same. Log: `paged in N weight tensors in Xs, then
   waited Ys for the other ranks`.
+- **Waiting for jobs without spinning** (`wake_test.py`, offline). The other
+  ranks receive each job through a CPU `all_sum`, and JACCL waits for one by
+  polling the Thunderbolt RDMA completion queue (`tbt_poll_cq`), so rank 1 held
+  one core at 100% for as long as the server was idle. Rank 0 now sends one byte
+  over TCP (`--wake-port`, default 8095, on rank 0's host from
+  `MLX_JACCL_COORDINATOR`) before each broadcast; the other ranks block on it and
+  only then enter the `all_sum`. If rank 0 dies, they see the socket close and
+  shut down. `--no-wake` turns it off. Log: `wake socket up on port 8095`.
 - Default `max_tokens` is 8192. Cline sends none, and the old 2048 default cut
   an answer off at exactly 2048 tokens.
 - Server log: `~/dsv4-server.log` on purple. (`~/vlm-server.log` there is a stale
