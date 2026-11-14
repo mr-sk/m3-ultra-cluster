@@ -41,6 +41,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `cluster_launch.py` | `~/cluster-env` | `mlx.launch` with its IO loop fixed so it doesn't spin ~1.7 cores while the job runs |
 | `needle_test.py` | `~/cluster-env` | Needle-in-a-haystack correctness test, Qwen3-Coder-Next via mlx-lm |
 | `dsv4_run.py` | `~/vlm-env` | Speed sweep + needle test for DeepSeek-V4-Flash via mlx-vlm |
+| `opencode_run.sh` | (any) | One unattended OpenCode run of a task prompt against a git repo, for repeatable agent tests |
 
 The two venvs are separate on purpose. `~/cluster-env` has mlx-lm 0.32.2;
 `~/vlm-env` has mlx-vlm 0.7.12. Both pin mlx 0.32.4, which must match on both
@@ -216,6 +217,34 @@ Orange never dropped below 21% free memory; swap did not grow on either node.
 The argument is a comma-separated list of prompt lengths (default
 `2048,4096,8192,16384`). Start with `2048` alone: at ~71 GiB of weights per
 node, DeepSeek sits right at the memory cliff.
+
+### opencode_run.sh
+
+Runs one OpenCode session unattended (`opencode run --standalone`, no
+`--auto`) from a prompt file and keeps what it did:
+
+```
+RESET=1 TEST_CMD="swift test" ./opencode_run.sh ~/path/to/repo prompt.txt runs b10
+```
+
+It writes `runs/b10.jsonl` (OpenCode's event stream), `.err`, `.diff` and,
+with `TEST_CMD`, `.test.txt`, then prints the diff stat and how the session
+ended (`last stop` means the model finished). It refuses to start if any
+OpenCode process is running: a TUI left open restarts OpenCode's background
+service within seconds, and in one run a second session edited the same repo
+at the same time. Without `RESET=1` the repo must already be clean.
+
+Used for the Test B repeats. Adding this general line to the task's working
+rules took the one requirement the model kept missing from 3 of 7 runs to
+4 of 4:
+
+> Before finishing: re-read the task. For each numbered step, quote every
+> clause in the task's exact words (do not paraphrase), and next to each, the
+> line of your code that does it. If a clause has no matching line, fix it,
+> then run `swift test` again.
+
+With "check every clause against your diff" instead, it was 3 of 4: the model
+paraphrased the clause it had missed and then reported it as done.
 
 ## Copying models between the nodes
 
