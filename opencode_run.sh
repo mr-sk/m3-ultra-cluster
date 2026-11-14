@@ -11,11 +11,12 @@
 #   RESET=1    discard uncommitted changes to tracked files first
 #              (git checkout -- .); otherwise the repo must already be clean
 #   TEST_CMD   run after the session, e.g. "swift test" (default: none)
+#   MODEL      provider/model to use instead of the config's default
 #
 # OpenCode must not be running: quit the TUI too, since it restarts the
 # background service within seconds, and a second session editing the same
 # repo spoils the run. The run uses a private server (--standalone) and the
-# default model from your OpenCode config. No --auto.
+# default model from your OpenCode config unless MODEL is set. No --auto.
 set -u
 
 if [ $# -ne 4 ]; then
@@ -44,8 +45,13 @@ if [ -n "$(git status --short --untracked-files=no)" ]; then
 fi
 
 echo "start $(date +%H:%M:%S)"
-opencode run --standalone --title "$NAME" --format json "$(cat "$PROMPT")" \
-    > "$OUT/$NAME.jsonl" 2> "$OUT/$NAME.err"
+if [ -n "${MODEL:-}" ]; then
+    opencode run --standalone --model "$MODEL" --title "$NAME" --format json "$(cat "$PROMPT")" \
+        > "$OUT/$NAME.jsonl" 2> "$OUT/$NAME.err"
+else
+    opencode run --standalone --title "$NAME" --format json "$(cat "$PROMPT")" \
+        > "$OUT/$NAME.jsonl" 2> "$OUT/$NAME.err"
+fi
 echo "exit $?, end $(date +%H:%M:%S)"
 
 git diff > "$OUT/$NAME.diff"
