@@ -165,6 +165,66 @@ def test_known_optional_conflict_still_plain_text_with_unknown_dropped():
     assert m.parse_dsml(text, [EDIT_TOOL])[1] == []
 
 
+
+def cut(text, at):
+    """A looped turn: generation stopped partway into the parameter named `at`."""
+    i = text.rindex(f'<｜DSML｜parameter name="{at}"')
+    return text[:i] + f'<｜DSML｜parameter name="{at}" string="true">half of it'
+
+
+def test_looped_call_keeps_its_finished_parameters():
+    # W5, 2026-11-14: the loop guard cut an edit off while it repeated
+    # `oldString`; the call reached the client as text with finish `length`.
+    text = cut(dsml(("edit", BASE + [("newString", "n"), ("oldString", "y")])), "oldString")
+    _, calls = m.parse_dsml(text, [EDIT_TOOL], truncated=True)
+    assert calls and args(calls[0]) == {"path": "a.swift", "oldString": "x", "newString": "n"}, calls
+
+def test_cut_off_call_still_plain_text_unless_looped():
+    text = cut(dsml(("edit", BASE + [("newString", "n"), ("oldString", "y")])), "oldString")
+    assert m.parse_dsml(text, [EDIT_TOOL])[1] == []
+
+def test_looped_repeat_of_a_parameter_collapses():
+    # W5's last turn: newString, oldString, the same oldString again, then a third
+    # one cut off. No path, so the client rejects it and the model retries.
+    old = ("oldString", "func test() {}")
+    text = cut(dsml(("edit", [("newString", "n"), old, old, old])), "oldString")
+    _, calls = m.parse_dsml(text, [EDIT_TOOL], truncated=True)
+    assert calls and args(calls[0]) == {"newString": "n", "oldString": "func test() {}"}, calls
+
+def test_looped_with_no_finished_parameter_gives_no_call():
+    text = cut(dsml(("edit", [("path", "a.swift")])), "path")
+    assert m.parse_dsml(text, [EDIT_TOOL], truncated=True)[1] == []
+
+def test_looped_inside_a_second_call_keeps_the_first():
+    first = BASE + [("newString", "n")]
+    text = cut(dsml(("edit", first), ("edit", [("path", "b.swift")])), "path")
+    _, calls = m.parse_dsml(text, [EDIT_TOOL], truncated=True)
+    assert [args(c) for c in calls] == [{"path": "a.swift", "oldString": "x", "newString": "n"}], calls
+
+
+
+def test_unclosed_call_before_the_next_is_closed():
+    # X3, 2026-11-14: two complete edits, the first without its closing tag.
+    # The parser read both as one call with two `oldString`s and the session ended.
+    one = BASE + [("newString", "n")]
+    two = [("path", "b.swift"), ("oldString", "y"), ("newString", "m")]
+    text = dsml(("edit", one), ("edit", two)).replace("</｜DSML｜invoke>\n", "", 1)
+    _, calls = m.parse_dsml(text, [EDIT_TOOL])
+    assert [args(c)["path"] for c in calls] == ["a.swift", "b.swift"], calls
+
+
+def test_restarted_call_keeps_the_first_calls_finished_parameters():
+    # X3's real shape: the first edit stopped partway into `newString` and the
+    # model started the same edit again as a second call.
+    first = '<｜DSML｜invoke name="edit">\n' + P % ("path", "a.swift") + P % ("oldString", "x") \
+        + '<｜DSML｜parameter name="newString" string="true">half of it\n'
+    second = dsml(("edit", BASE + [("newString", "n")]))
+    text = second.replace("<｜DSML｜tool_calls>\n", "<｜DSML｜tool_calls>\n" + first, 1)
+    _, calls = m.parse_dsml(text, [EDIT_TOOL])
+    assert [args(c) for c in calls] == [{"path": "a.swift", "oldString": "x"},
+                                        {"path": "a.swift", "oldString": "x", "newString": "n"}], calls
+
+
 bad = 0
 tests = [(k, v) for k, v in list(globals().items()) if k.startswith("test_")]
 for name, fn in tests:

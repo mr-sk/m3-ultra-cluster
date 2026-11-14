@@ -128,6 +128,25 @@ Limits:
   went to the client as text, ending the session); the tool doesn't take it, so
   nothing is lost. A conflict on an optional parameter the tool does take still
   fails parsing.
+- **Loop guard** (`repeat_test.py`, offline). Generation stops when the last 200
+  characters already appeared 4 times in the last 6,000. A turn stopped in plain
+  text ends with finish `length`. A turn stopped inside a tool call keeps the
+  parameters that finished, goes through the duplicate and conflict handling
+  above, and ends with `tool_calls`: a complete call runs, an incomplete one
+  fails the client's validation and the model retries. Before this, the cut-off
+  call went to the client as text with `length`; in W5 (2026-11-14) the model
+  was repeating `oldString` inside an edit, OpenCode answered `length` with its
+  "smaller pieces" message, the model looped again, and after three such turns
+  the headless session gave up with 4 tests failing. Replayed from that state:
+  the guard fired twice in 8 resends and both turns came back as edits missing
+  `path`; after OpenCode's rejection, 8 of 8 next turns were proper tool calls
+  with no loop.
+- **A call left open when the next one starts** (`repeat_test.py`). In X3
+  (2026-11-14) the model stopped partway into an edit's `newString` and wrote
+  the same edit again as a new call; the parser read both as one call with two
+  `oldString`s, the reply reached OpenCode as text and the session ended after
+  1.7 minutes. The open call now keeps only its finished parameters and is
+  closed, so the client rejects it and runs the next one.
 - **Warm-up before serving.** All ranks run a tiny generation after loading (about
   7 s; a normal tiny request takes 0.3 s). Without it, a request arriving the
   moment the server came up crashed both ranks with a Metal GPU timeout.

@@ -735,15 +735,72 @@ def _drop_conflicting_required(body, tools):
     return "".join(parts)
 
 
-def parse_dsml(text, tools=None):
-    """Return (content before the calls, [openai tool_call, ...]) or (text, [])."""
+_PARAM_END, _INVOKE_END = "</｜DSML｜parameter>", "</｜DSML｜invoke>"
+
+
+def _close_cut_off(body):
+    """Close a tool-calls block that stopped partway, after its last finished part.
+
+    The loop guard stops a turn mid-call. In W5 (2026-11-14) the model was
+    repeating `oldString` inside an edit; the cut-off call reached OpenCode as
+    text with finish `length`, three turns running, and the headless session
+    gave up. Kept to the parameters that finished, the call goes through the
+    usual duplicate and conflict handling: a complete call runs, an incomplete
+    one fails the client's validation and the model retries. Returns None if
+    no parameter finished.
+    """
+    p, v = body.rfind(_PARAM_END), body.rfind(_INVOKE_END)
+    if max(p, v) == -1:
+        return None
+    if v > p:
+        return body[:v + len(_INVOKE_END)] + "\n"
+    return body[:p + len(_PARAM_END)] + "\n" + _INVOKE_END + "\n"
+
+
+def _close_unclosed_invokes(body):
+    """Close a tool call that is still open when the next one starts.
+
+    In X3 (2026-11-14) the model stopped partway into an edit's `newString` and
+    started the same edit again as a new call. The parser read both as one call
+    with two `oldString`s, the whole reply reached OpenCode as text and the
+    session ended. The open call keeps only its finished parameters (as in
+    _close_cut_off), so it fails the client's validation; the next call is
+    unaffected. No value is guessed.
+    """
+    parts = re.split(r"(?=<｜DSML｜invoke )", body)
+    fixed = 0
+    for k in range(len(parts) - 1):
+        if parts[k].startswith("<｜DSML｜invoke ") and _INVOKE_END not in parts[k]:
+            closed = _close_cut_off(parts[k])
+            if closed is None:  # no parameter finished: an empty call
+                closed = parts[k].split("\n", 1)[0] + "\n" + _INVOKE_END + "\n"
+            parts[k] = closed
+            fixed += 1
+    if fixed:
+        log(f"DSML: closed {fixed} tool call(s) left open before the next one")
+    return "".join(parts)
+
+
+def parse_dsml(text, tools=None, truncated=False):
+    """Return (content before the calls, [openai tool_call, ...]) or (text, []).
+
+    truncated: generation was cut off (loop guard), so a call without its
+    closing tag is closed after its last finished parameter.
+    """
     i = text.find(DSML_OPEN)
     if i == -1:
         return text, []
     body = text[i + len(DSML_OPEN):]
     j = body.find(DSML_STOP)
+    if j == -1 and truncated:
+        closed = _close_cut_off(body)
+        if closed is None:
+            return text, []
+        log("DSML: generation stopped inside a tool call; kept its finished parameters")
+        body, j = closed, len(closed)
     # Generation stops on the closing tag's stem, so put the full tag back.
-    body = _drop_identical_duplicates((body[:j] if j != -1 else body) + DSML_END)
+    body = _close_unclosed_invokes(body[:j] if j != -1 else body)
+    body = _drop_identical_duplicates(body + DSML_END)
     body = _drop_conflicting_required(body, tools)
     _dsml_fixups.clear()
     try:
@@ -1079,15 +1136,17 @@ def make_handler(world, model, processor, config, model_id):
             text, _ = apply_stop(src, stops)
             tool_calls = []
             if job["tool_open"]:
-                text, tool_calls = (parse_dsml(text, body.get("tools")) if job["tool_format"] == "dsml"
-                                    else parse_tool_call(text))
+                text, tool_calls = (parse_dsml(text, body.get("tools"), truncated=bool(job.get("_looped")))
+                                    if job["tool_format"] == "dsml" else parse_tool_call(text))
                 if tool_calls:
                     check_required(tool_calls, body.get("tools"), state["text"])
 
-            if job.get("_looped"):
-                finish = "length"  # cut short; tell the client it is incomplete
-            elif tool_calls:
+            if tool_calls:
+                # Includes a call kept from a looped turn: the client then runs it
+                # or rejects it, instead of seeing `length` (see _close_cut_off).
                 finish = "tool_calls"
+            elif job.get("_looped"):
+                finish = "length"  # cut short; tell the client it is incomplete
             elif state["stopped"]:
                 finish = "stop"
             elif last is not None and last.generation_tokens >= job["max_tokens"]:
