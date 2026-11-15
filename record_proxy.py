@@ -3,15 +3,22 @@
 
     client -> http://127.0.0.1:8091/v1 -> this proxy -> upstream server
 
-Everything passes through unchanged. Each POST is also saved as it streams, so a
-turn that loops or gets killed still leaves its text:
+Everything passes through unchanged, except with --rules (below). Each POST is
+also saved as it streams, so a turn that loops or gets killed still leaves its text:
 
     <dir>/<HHMMSS>-<n>.request.json   the request body
     <dir>/<HHMMSS>-<n>.stream.txt     reasoning, answer and tool-call text, as it arrives
     <dir>/live.txt                    the current turn only (tail -f this)
 
 usage: record_proxy.py --upstream http://HOST:8090 [--port 8091] [--dir ~/dsv4-proxy]
+                       [--rules FILE]
 Binds to 127.0.0.1 only. Recordings contain your prompts and code: keep them local.
+
+--rules FILE puts the file's text at the top of the first user message of every
+request that offers tools (agent turns; OpenCode's title requests have none),
+unless that message already starts with it. That is where the Test B runs pasted
+the working rules, so the model sees the same thing without anyone pasting them.
+The saved request is the one sent upstream, rules included.
 """
 import argparse
 import http.client
@@ -49,7 +56,35 @@ def extract(line):
     return "".join(out)
 
 
-def make_handler(upstream, folder):
+def add_rules(body, rules):
+    """Return (body, added): `rules` put before the first user message's text."""
+    if not rules:
+        return body, False
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body, False
+    if not isinstance(data, dict) or not data.get("tools"):
+        return body, False
+    user = next((x for x in data.get("messages") or [] if isinstance(x, dict) and x.get("role") == "user"), None)
+    if user is None:
+        return body, False
+    content = user.get("content")
+    if isinstance(content, str):
+        if content.startswith(rules):
+            return body, False
+        user["content"] = rules + "\n\n" + content
+    elif isinstance(content, list):
+        part = next((x for x in content if isinstance(x, dict) and x.get("type") == "text"), None)
+        if part is None or str(part.get("text", "")).startswith(rules):
+            return body, False
+        part["text"] = rules + "\n\n" + part.get("text", "")
+    else:
+        return body, False
+    return json.dumps(data, ensure_ascii=False).encode(), True
+
+
+def make_handler(upstream, folder, rules=None):
     target = urlsplit(upstream)
 
     class Handler(BaseHTTPRequestHandler):
@@ -85,6 +120,9 @@ def make_handler(upstream, folder):
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             stem = os.path.join(folder, f"{time.strftime('%H%M%S')}-{next(COUNTER):04d}")
+            body, added = add_rules(body, rules)
+            if added:
+                print(f"{os.path.basename(stem)}: added working rules", file=sys.stderr, flush=True)
             with open(stem + ".request.json", "wb") as f:
                 f.write(body)
             try:
@@ -120,11 +158,14 @@ def main():
     ap.add_argument("--upstream", required=True)
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--dir", default="~/dsv4-proxy")
+    ap.add_argument("--rules", help="file whose text goes before the first user message (agent turns)")
     args = ap.parse_args()
+    rules = open(os.path.expanduser(args.rules)).read().strip() if args.rules else None
     folder = os.path.join(os.path.expanduser(args.dir), time.strftime("%Y-%m-%d"))
     os.makedirs(folder, exist_ok=True)
-    print(f"127.0.0.1:{args.port} -> {args.upstream}, recording to {folder}", file=sys.stderr, flush=True)
-    ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args.upstream, folder)).serve_forever()
+    print(f"127.0.0.1:{args.port} -> {args.upstream}, recording to {folder}"
+          + (f", adding rules from {args.rules}" if rules else ""), file=sys.stderr, flush=True)
+    ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args.upstream, folder, rules)).serve_forever()
 
 
 if __name__ == "__main__":

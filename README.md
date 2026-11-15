@@ -42,6 +42,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `needle_test.py` | `~/cluster-env` | Needle-in-a-haystack correctness test, Qwen3-Coder-Next via mlx-lm |
 | `dsv4_run.py` | `~/vlm-env` | Speed sweep + needle test for DeepSeek-V4-Flash via mlx-vlm |
 | `opencode_run.sh` | (any) | One unattended OpenCode run of a task prompt against a git repo, for repeatable agent tests |
+| `record_proxy.py` | (any, stdlib) | Recording proxy between a client and the server; can add working rules to every agent turn |
 
 The two venvs are separate on purpose. `~/cluster-env` has mlx-lm 0.32.2;
 `~/vlm-env` has mlx-vlm 0.7.12. Both pin mlx 0.32.4, which must match on both
@@ -236,6 +237,24 @@ Orange never dropped below 21% free memory; swap did not grow on either node.
 The argument is a comma-separated list of prompt lengths (default
 `2048,4096,8192,16384`). Start with `2048` alone: at ~71 GiB of weights per
 node, DeepSeek sits right at the memory cliff.
+
+### record_proxy.py
+
+Sits between a client (OpenCode) and the server on 127.0.0.1 and saves each request
+and the streamed reply as it arrives, so a turn that loops or gets killed still
+leaves its text. Recordings contain your prompts and code: keep them local.
+
+```
+python3 record_proxy.py --upstream http://SERVER:8090 [--rules working_rules.txt]
+```
+
+With `--rules`, the file's text goes at the top of the first user message of every
+request that offers tools, unless the message already starts with it. That is where
+the Test B runs pasted the working rules (OpenCode 2.2.6 ignores `AGENTS.md`), so
+every session gets them without pasting. Checked on Test B: the injected first
+message matched the hand-pasted prompt byte for byte, and 3 of 4 runs met the
+requirement the rule targets (22 of 23 across all runs with the rule, 3 of 7
+without). `working_rules.txt` is a general version. Tests: `proxy_test.py`.
 
 ### opencode_run.sh
 
