@@ -288,7 +288,9 @@ the Test B runs pasted the working rules (OpenCode 2.2.6 ignores `AGENTS.md`), s
 every session gets them without pasting. Checked on Test B: the injected first
 message matched the hand-pasted prompt byte for byte, and 3 of 4 runs met the
 requirement the rule targets (22 of 23 across all runs with the rule, 3 of 7
-without). `working_rules.txt` is a general version. Tests: `proxy_test.py`.
+without). `working_rules.txt` is a general version. Tests: `proxy_test.py`. Its edit line ("path first, then oldString, then newString") halved rejected
+edit turns on Test B (30 to 16 over 4 runs; missing `path` 20 to 7), though the share of
+tokens in rejected edits stayed ~24%: the rest are large edits missing oldString or newString.
 
 ### opencode_run.sh
 
