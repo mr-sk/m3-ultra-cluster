@@ -43,6 +43,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `dsv4_run.py` | `~/vlm-env` | Speed sweep + needle test for DeepSeek-V4-Flash via mlx-vlm |
 | `opencode_run.sh` | (any) | One unattended OpenCode run of a task prompt against a git repo, for repeatable agent tests |
 | `record_proxy.py` | (any, stdlib) | Recording proxy between a client and the server; can add working rules to every agent turn |
+| `bench_mtp.py` | `~/vlm-env` | Speculative decoding with DeepSeek-V4-Flash-0731's DSpark drafter on the pipelined cluster (experiment: no speedup) |
 
 The two venvs are separate on purpose. `~/cluster-env` has mlx-lm 0.32.2;
 `~/vlm-env` has mlx-vlm 0.7.12. Both pin mlx 0.32.4, which must match on both
@@ -237,6 +238,39 @@ Orange never dropped below 21% free memory; swap did not grow on either node.
 The argument is a comma-separated list of prompt lengths (default
 `2048,4096,8192,16384`). Start with `2048` alone: at ~71 GiB of weights per
 node, DeepSeek sits right at the memory cliff.
+
+### bench_mtp.py: speculative decoding (tried, not worth it here)
+
+DeepSeek-V4-Flash-0731 ships a DSpark block drafter (`dspark_block_size = 5`, reading
+layers 40-42), which our 4-bit conversion dropped. Its tensors are in the last 3 of
+the official checkpoint's 48 files (~10.5 GB); mlx-vlm 0.7.12 builds the drafter when
+`load_drafter` is given that folder (config, index and those 3 files). Running it on
+the pipelined model needed two fixes, both in this script:
+
+- Layer captures are recorded only on the rank that owns layers 40-42 (the final
+  hidden state is all_gathered; captures are not). Each capture is all_summed, the
+  owner contributing it and the other rank zeros.
+- MLX runs collectives in dependency order. The zeros depend on nothing, so the
+  non-owner's all_sum went out before its pipeline send while the owner waited in
+  recv: deadlock. Each capture now depends on the final output (`mx.depends`).
+
+Memory: the drafter is ~10 GiB (already FP8/FP4), so each node runs at 80.6 GiB
+active, 82.6-83.7 GiB peak, against the 84 GiB wired limit; the warm-up needs the
+server's wired-limit setup or it hits a GPU timeout.
+
+Results (greedy, a real 15k-token prompt, 2026-11-15):
+
+| Run | tok/s | Tokens per round | Drafts accepted | Output = plain greedy |
+|---|---|---|---|---|
+| No drafter | 28.8 | 1 | - | - |
+| Block 3 | 23.7 | 2.91 | 95.5% | yes |
+| Block 5 | 24.8 | 4.57 | 90.1% | yes |
+
+The drafter is good and cheap (16 ms per round), but verifying 5 tokens costs 155 ms
+against 29 ms for one: each token routes to its own experts, so a 5-token pass reads
+~5x the expert weights, and decoding is bound by memory reads. Speculative decoding
+only pays when checking k tokens costs much less than k steps; here it can't beat
+plain decoding, so the server doesn't use it.
 
 ### record_proxy.py
 
