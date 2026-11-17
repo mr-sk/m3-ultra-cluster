@@ -292,6 +292,14 @@ without). `working_rules.txt` is a general version. Tests: `proxy_test.py`. Its 
 edit turns on Test B (30 to 16 over 4 runs; missing `path` 20 to 7), though the share of
 tokens in rejected edits stayed ~24%: the rest are large edits missing oldString or newString.
 
+With `--fill-edit-path` the proxy also fills a missing `path` in an `edit` call when
+the session history makes it unambiguous: exactly one file the session has read,
+edited or written contains the call's `oldString` (20+ characters). Each fill is
+logged; anything else passes unchanged and the client rejects it as before. OpenCode
+still checks that `oldString` is in that file before editing. Checked against all our
+recordings (`path_fill_eval.py`): of the rejected no-path edits whose retry shows the
+intended file, 51 inferred right, 0 wrong, 2 left alone.
+
 ### opencode_run.sh
 
 Runs one OpenCode session unattended (`opencode run --standalone`, no

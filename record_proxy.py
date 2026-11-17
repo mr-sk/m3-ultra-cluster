@@ -11,8 +11,13 @@ also saved as it streams, so a turn that loops or gets killed still leaves its t
     <dir>/live.txt                    the current turn only (tail -f this)
 
 usage: record_proxy.py --upstream http://HOST:8090 [--port 8091] [--dir ~/dsv4-proxy]
-                       [--rules FILE]
+                       [--rules FILE] [--fill-edit-path]
 Binds to 127.0.0.1 only. Recordings contain your prompts and code: keep them local.
+
+--fill-edit-path (off by default) fills a missing `path` in an `edit` tool call
+when the session history makes it unambiguous: exactly one file the session has
+read, edited or written contains the call's `oldString` (20+ characters). Each fill
+is logged. Otherwise the call passes unchanged and the client rejects it.
 
 --rules FILE puts the file's text at the top of the first user message of every
 request that offers tools (agent turns; OpenCode's title requests have none),
@@ -25,6 +30,7 @@ import http.client
 import itertools
 import json
 import os
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -84,7 +90,100 @@ def add_rules(body, rules):
     return json.dumps(data, ensure_ascii=False).encode(), True
 
 
-def make_handler(upstream, folder, rules=None):
+# --- --fill-edit-path ------------------------------------------------------------
+# Test B, 2026-11-15: a quarter of generated tokens went into edit calls OpenCode
+# rejected, most missing `path` with oldString and newString present; the model
+# then regenerates the whole edit. Checked against recordings: 51 of 53 rejected
+# no-path edits whose retry shows the intended file were inferred right, 0 wrong,
+# 2 left alone.
+MIN_OLD = 20  # shorter oldStrings ("}", "    }\n") match too much to be evidence
+_READ_HEAD = re.compile(r"^Read file (\S.*?), lines \d+-\d+\n")
+_LINE_NO = re.compile(r"^\d+: ", re.M)
+
+
+def _text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return ""
+
+
+def known_text(messages):
+    """{path: [text fragments the file is known to contain]} from reads, edits, writes."""
+    calls, known = {}, {}
+    for m in messages:
+        for c in m.get("tool_calls") or []:
+            fn = c.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            calls[c.get("id")] = (fn.get("name"), args)
+        if m.get("role") != "tool":
+            continue
+        name, args = calls.get(m.get("tool_call_id"), (None, {}))
+        out = _text(m.get("content"))
+        path = args.get("path") if isinstance(args, dict) else None
+        if not path or out.lstrip().startswith('{"error"'):
+            continue
+        if name == "read":
+            head = _READ_HEAD.match(out)
+            body = out[head.end():] if head else out
+            known.setdefault(path, []).append(_LINE_NO.sub("", body))
+        elif name == "edit" and out.startswith("Edited") and args.get("newString"):
+            known.setdefault(path, []).append(args["newString"])
+        elif name == "write" and args.get("content") is not None:
+            known[path] = [args["content"]]
+    return known
+
+
+def infer_edit_path(messages, old_string):
+    if not isinstance(old_string, str) or len(old_string.strip()) < MIN_OLD:
+        return None
+    hits = [p for p, parts in known_text(messages).items() if any(old_string in t for t in parts)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _requires_path(tools, name):
+    for t in tools or []:
+        f = t.get("function", t) if isinstance(t, dict) else {}
+        if f.get("name") == name:
+            return "path" in ((f.get("parameters") or {}).get("required") or [])
+    return False
+
+
+def fill_edit_path(line, messages, tools):
+    """Return (line, [filled paths]): an SSE line with missing edit paths filled in."""
+    if not line.startswith(b"data: {") or b"tool_calls" not in line:
+        return line, []
+    try:
+        data = json.loads(line[6:])
+    except ValueError:
+        return line, []
+    filled = []
+    for choice in data.get("choices") or []:
+        for call in (choice.get("delta") or {}).get("tool_calls") or []:
+            fn = call.get("function") or {}
+            if fn.get("name") != "edit" or not _requires_path(tools, "edit"):
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                continue
+            if not isinstance(args, dict) or "path" in args:
+                continue
+            path = infer_edit_path(messages, args.get("oldString"))
+            if path:
+                fn["arguments"] = json.dumps({"path": path, **args}, ensure_ascii=False)
+                filled.append(path)
+    if not filled:
+        return line, []
+    ending = line[len(line.rstrip(b"\r\n")):]
+    return b"data: " + json.dumps(data, ensure_ascii=False).encode() + ending, filled
+
+
+def make_handler(upstream, folder, rules=None, fill_path=False):
     target = urlsplit(upstream)
 
     class Handler(BaseHTTPRequestHandler):
@@ -123,6 +222,13 @@ def make_handler(upstream, folder, rules=None):
             body, added = add_rules(body, rules)
             if added:
                 print(f"{os.path.basename(stem)}: added working rules", file=sys.stderr, flush=True)
+            history = tools = None
+            if fill_path:
+                try:
+                    req = json.loads(body)
+                    history, tools = req.get("messages") or [], req.get("tools") or []
+                except (ValueError, AttributeError):
+                    history = None
             with open(stem + ".request.json", "wb") as f:
                 f.write(body)
             try:
@@ -137,6 +243,11 @@ def make_handler(upstream, folder, rules=None):
                     line = resp.readline()
                     if not line:
                         break
+                    if history is not None:
+                        line, filled = fill_edit_path(line, history, tools)
+                        for path in filled:
+                            print(f"{os.path.basename(stem)}: filled missing edit path {path}",
+                                  file=sys.stderr, flush=True)
                     text = extract(line)
                     if text:
                         rec.write(text)
@@ -159,13 +270,17 @@ def main():
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--dir", default="~/dsv4-proxy")
     ap.add_argument("--rules", help="file whose text goes before the first user message (agent turns)")
+    ap.add_argument("--fill-edit-path", action="store_true",
+                    help="fill an edit call's missing path when the history makes it unambiguous")
     args = ap.parse_args()
     rules = open(os.path.expanduser(args.rules)).read().strip() if args.rules else None
     folder = os.path.join(os.path.expanduser(args.dir), time.strftime("%Y-%m-%d"))
     os.makedirs(folder, exist_ok=True)
     print(f"127.0.0.1:{args.port} -> {args.upstream}, recording to {folder}"
-          + (f", adding rules from {args.rules}" if rules else ""), file=sys.stderr, flush=True)
-    ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args.upstream, folder, rules)).serve_forever()
+          + (f", adding rules from {args.rules}" if rules else "")
+          + (", filling missing edit paths" if args.fill_edit_path else ""), file=sys.stderr, flush=True)
+    ThreadingHTTPServer(("127.0.0.1", args.port),
+                        make_handler(args.upstream, folder, rules, args.fill_edit_path)).serve_forever()
 
 
 if __name__ == "__main__":

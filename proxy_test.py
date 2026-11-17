@@ -55,6 +55,70 @@ def test_no_rules_or_bad_json_pass_through():
     assert m.add_rules(b"not json", RULES) == (b"not json", False)
 
 
+EDIT_TOOLS = [{"type": "function", "function": {"name": "edit", "parameters": {
+    "properties": {"path": {}, "oldString": {}, "newString": {}}, "required": ["path", "oldString", "newString"]}}}]
+OLD = "    private let key = \"virtualdesktopbadgeNotes\""
+
+
+def read_turn(cid, path, text):
+    body = "\n".join(f"{i}: {ln}" for i, ln in enumerate(text.split("\n"), 1))
+    return [{"role": "assistant", "content": "", "tool_calls": [{"id": cid, "type": "function",
+             "function": {"name": "read", "arguments": json.dumps({"path": path})}}]},
+            {"role": "tool", "tool_call_id": cid, "content": f"Read file {path}, lines 1-9\n{body}"}]
+
+
+def sse(calls):
+    delta = {"tool_calls": [{"index": i, "id": f"c{i}", "type": "function",
+                             "function": {"name": n, "arguments": json.dumps(a)}} for i, (n, a) in enumerate(calls)]}
+    return b"data: " + json.dumps({"choices": [{"index": 0, "delta": delta}]}).encode() + b"\n"
+
+
+def args_of(line, i=0):
+    return json.loads(json.loads(line[6:])["choices"][0]["delta"]["tool_calls"][i]["function"]["arguments"])
+
+
+HISTORY = read_turn("r1", "/repo/NoteStore.swift", "import Foundation\n" + OLD + "\n}") + \
+          read_turn("r2", "/repo/SpaceIndex.swift", "func spaceIndex() {}\n")
+
+
+def test_missing_path_filled_when_one_file_has_the_text():
+    line, filled = m.fill_edit_path(sse([("edit", {"oldString": OLD, "newString": "x"})]), HISTORY, EDIT_TOOLS)
+    assert filled == ["/repo/NoteStore.swift"] and args_of(line)["path"] == "/repo/NoteStore.swift", line
+
+def test_ambiguous_text_is_left_alone():
+    hist = HISTORY + read_turn("r3", "/repo/Copy.swift", OLD)
+    line = sse([("edit", {"oldString": OLD, "newString": "x"})])
+    assert m.fill_edit_path(line, hist, EDIT_TOOLS) == (line, [])
+
+def test_short_old_string_is_left_alone():
+    line = sse([("edit", {"oldString": "}", "newString": "x"})])
+    assert m.fill_edit_path(line, HISTORY, EDIT_TOOLS) == (line, [])
+
+def test_text_no_file_has_is_left_alone():
+    line = sse([("edit", {"oldString": "something never read anywhere", "newString": "x"})])
+    assert m.fill_edit_path(line, HISTORY, EDIT_TOOLS) == (line, [])
+
+def test_call_with_path_and_other_tools_untouched():
+    line = sse([("edit", {"path": "/repo/X.swift", "oldString": OLD, "newString": "x"}), ("read", {"path": "/a"})])
+    assert m.fill_edit_path(line, HISTORY, EDIT_TOOLS) == (line, [])
+
+def test_only_when_the_schema_requires_path():
+    line = sse([("edit", {"oldString": OLD, "newString": "x"})])
+    no_path_schema = [{"type": "function", "function": {"name": "edit", "parameters": {"required": ["oldString"]}}}]
+    assert m.fill_edit_path(line, HISTORY, no_path_schema) == (line, [])
+
+def test_non_tool_lines_pass_through():
+    for line in (b"data: [DONE]\n", b"data: {\"choices\": [{\"delta\": {\"content\": \"hi\"}}]}\n", b": ping\n"):
+        assert m.fill_edit_path(line, HISTORY, EDIT_TOOLS) == (line, [])
+
+def test_failed_edits_do_not_count_as_known_text():
+    hist = HISTORY[:2] + [{"role": "assistant", "content": "", "tool_calls": [{"id": "e1", "type": "function",
+        "function": {"name": "edit", "arguments": json.dumps({"path": "/repo/Other.swift", "oldString": "q", "newString": OLD})}}]},
+        {"role": "tool", "tool_call_id": "e1", "content": "{\"error\": {\"message\": \"Could not find oldString\"}}"}]
+    line, filled = m.fill_edit_path(sse([("edit", {"oldString": OLD, "newString": "x"})]), hist, EDIT_TOOLS)
+    assert filled == ["/repo/NoteStore.swift"], filled
+
+
 bad = 0
 tests = [(k, v) for k, v in list(globals().items()) if k.startswith("test_")]
 for name, fn in tests:
