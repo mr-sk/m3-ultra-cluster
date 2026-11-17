@@ -3,6 +3,7 @@ the whole solution up front (edit, test, adjust); if the task is ambiguous, say 
 and ask; edit files only with the edit tool, never shell commands; run the tests after
 edits and read the output; keep the final summary short and only describe real changes.
 Every edit call gives path first, then oldString, then newString; never leave one out.
+Keep text before a tool call under 50 words.
 Before finishing: re-read the task. For each numbered step, quote every clause in the task's
 exact words (do not paraphrase), and next to each, the line of your code that does it. If a
 clause has no matching line, fix it, then run the tests again.

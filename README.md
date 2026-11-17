@@ -300,6 +300,14 @@ still checks that `oldString` is in that file before editing. Checked against al
 recordings (`path_fill_eval.py`): of the rejected no-path edits whose retry shows the
 intended file, 51 inferred right, 0 wrong, 2 left alone.
 
+Its last rule, "Keep text before a tool call under 50 words", targets long write-ups
+before cheap calls (in one Test C batch, 49% of generated tokens were in turns that
+only called `read` or `shell`). With it, Test B took 29.3 min over 4 runs against 35.4
+(tokens -17%), with the same quality; on Test C quality held and runs were faster
+than without it. A version that added "When stuck, don't reason it out in text: read
+the code or run the tests" was faster still but deleted existing tests in all 4
+Test C runs, so it was dropped.
+
 ### opencode_run.sh
 
 Runs one OpenCode session unattended (`opencode run --standalone`, no
