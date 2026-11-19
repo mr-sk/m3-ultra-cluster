@@ -7,6 +7,34 @@
 All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
 `mlx.launch` starts the same script on both machines.
 
+## TL;DR
+
+- **What:** DeepSeek-V4-Flash-0731 (MLX 4-bit, 144 GB, converted with
+  `dsv4_0731_convert.py`) split across two M3 Ultra Mac Studios (96 GB each),
+  half the layers on each, over Thunderbolt 5 with MLX's JACCL backend. Served as
+  an OpenAI-compatible API on purple, port 8090.
+- **Start** (on purple, after the reboot checks below):
+  ```bash
+  nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
+    $HOME/vlm-env/bin/python $HOME/vlm_cluster_server.py \
+    --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 > ~/dsv4-server.log 2>&1 < /dev/null &
+  ```
+  Stop: `pkill -f vlm_cluster_server.py` (orange's half exits with it).
+- **Speed:** ~29 tok/s decoding, ~700 tok/s reading new prompt tokens; a prompt
+  that repeats an earlier prefix is read from a cache.
+- **Coding agent:** OpenCode through `record_proxy.py --rules working_rules.txt
+  --fill-edit-path` on the client Mac, which adds the working rules to every agent
+  turn and fills an edit call's missing `path` when the history makes it
+  unambiguous. Test B (a Swift change with a data migration and tests) runs
+  unattended in ~7 min: 4 runs in 29.3 min, all finishing with tests passing.
+- **DeepSeek tool-call fixes in the server** (`repeat_test.py`): identical or
+  conflicting repeated DSML parameters, calls cut off by the loop guard, calls left
+  open when the next one starts.
+- **Tried and not used:** speculative decoding with the model's own DSpark drafter
+  (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
+  both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
+  costs ~170-210 us); thinking mode (no gain on Test B).
+
 ## Before any cluster run
 
 These reset on every reboot. Check them first.
@@ -58,7 +86,7 @@ node over `mx.distributed`; both generate in lockstep.
 ```bash
 nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
   $HOME/vlm-env/bin/python $HOME/vlm_cluster_server.py \
-  --model mlx-community/DeepSeek-V4-Flash-4bit --port 8090 > ~/vlm-server.log 2>&1 &
+  --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 > ~/dsv4-server.log 2>&1 < /dev/null &
 
 curl -s localhost:8090/health
 ```
