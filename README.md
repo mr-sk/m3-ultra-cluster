@@ -35,6 +35,196 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
   costs ~170-210 us); thinking mode (no gain on Test B).
 
+## How this works, and what we learned
+
+This section explains the setup from the ground up: what each piece does, why it is
+there, and what we measured along the way. The per-script sections further down are
+the reference for flags and details.
+
+### 1. The model, and why it needs two machines
+
+[DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) is a
+[mixture-of-experts](https://en.wikipedia.org/wiki/Mixture_of_experts) (MoE) language
+model: each layer holds many small "expert" networks, and a router picks a few of them
+for every token. Only those experts run, so a token costs far less compute than the
+model's size suggests, but all experts still have to be in memory, because the next
+token may pick different ones.
+
+The official checkpoint stores most expert weights in 4-bit floating point and the rest
+of the large matrices in 8-bit floating point. `dsv4_0731_convert.py` repacks those into
+MLX's own [microscaling](https://arxiv.org/abs/2310.10537) formats (MXFP4 and MXFP8,
+lossless) and [quantizes](https://en.wikipedia.org/wiki/Quantization_(signal_processing))
+the remaining full-precision layers to 4 bits. The result is 144 GB. An M3 Ultra Mac
+Studio has 96 GB of [unified memory](https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html),
+shared by the CPU and GPU, so one machine can't hold it; two can, at about 71 GiB each.
+The GPU's share is capped by `iogpu.wired_limit_mb` (84 GiB here), which is why that
+setting is in the reboot checklist.
+
+Everything runs on [MLX](https://github.com/ml-explore/mlx), Apple's array framework,
+with the model code from [mlx-vlm](https://github.com/Blaizzy/mlx-vlm). MLX is
+[lazy](https://ml-explore.github.io/mlx/build/html/usage/lazy_evaluation.html):
+operations build a graph that runs only when a result is needed. That detail matters
+twice below.
+
+### 2. Splitting the model: pipeline parallelism over Thunderbolt
+
+The two Studios are joined by two [Thunderbolt 5](https://en.wikipedia.org/wiki/Thunderbolt_(interface))
+cables used for [RDMA](https://en.wikipedia.org/wiki/Remote_direct_memory_access), which
+lets one machine write into the other's memory without going through the network stack.
+MLX talks to it through its JACCL [distributed backend](https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
+
+The model is split by **[pipeline parallelism](https://arxiv.org/abs/1811.06965)**: one
+Studio holds the first half of the 43 layers, the other the second half. For each token,
+orange runs its layers and hands the result to purple, which runs the rest and shares
+the output with every rank. Only a few small tensors cross the link per token. The cost is
+that each machine waits while the other works.
+
+`vlm_cluster_server.py` turns this into an OpenAI-style chat API. Purple (rank 0) serves
+HTTP, and every request is broadcast to both ranks so they run the same generation in
+lockstep. Two fixes keep idle machines idle:
+
+- **Waiting without spinning.** Waiting for the next job inside a JACCL collective polls
+  in a loop and keeps a CPU core at 100%. Workers now block on a plain TCP "wake socket"
+  instead, and join the collective only when a job is coming.
+- **`cluster_launch.py`.** Stock `mlx.launch` (0.32.4) never sleeps in its I/O loop and
+  burned ~1.7 cores for the whole life of the job. This is a copy of it with that loop fixed.
+
+The other server-side problem was the GPU stalling on memory that macOS had quietly
+evicted. If a single GPU command takes too long, macOS aborts it with a "GPU timeout",
+and both ranks crash. The fixes: keep the weights resident (MLX's residency refresh, with
+the wired limit held raised); touch every weight, one tensor per GPU command, at startup
+and before any job that follows more than 60 s of idle; and run a tiny warm-up generation
+before serving.
+
+### 3. Prefill, decode, and why decoding is slow
+
+Generating a reply has two phases:
+
+- **Prefill** reads the prompt. All its tokens go through the model together, so each
+  weight read from memory is used for hundreds of tokens. Here that runs at roughly
+  600-700 tokens/s, in chunks of 512 (larger chunks made the GPU time out).
+- **Decode** produces the reply one token at a time. Every token needs all the active
+  weights read from memory again, for just that one token, so speed is set by
+  [memory bandwidth](https://en.wikipedia.org/wiki/Memory_bandwidth), not by compute.
+  Here that's about 29 tokens/s.
+
+Coding agents send the whole conversation again on every turn, so the server keeps a
+[KV cache](https://huggingface.co/docs/transformers/main/en/kv_cache) of earlier prompts
+and only prefills what is new. In practice almost all of an agent run's time is decode:
+in four measured coding-task runs, 83% of the wall time was the model writing tokens,
+14% reading prompts, and about 3% the agent's own tools and tests. So a run takes
+roughly *tokens generated ÷ 29 tok/s*, and there are only two ways to make it faster:
+write fewer tokens, or write them faster. Sections 5 and 6 are about each.
+
+### 4. Making tool calls reliable
+
+The client is [OpenCode](https://opencode.ai), a terminal coding agent. It gives the
+model [tools](https://platform.openai.com/docs/guides/function-calling) (read a file, edit
+a file, run a shell command), streams replies over
+[server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events),
+runs whatever tool calls come back, and returns the results to the model.
+
+DeepSeek-V4 writes tool calls in its own markup, DSML. The server builds the prompt with
+DeepSeek's reference encoder (`dsv4_encoding.py`) and parses the calls back into the
+OpenAI format. One property drives most of the work here: **if a tool call fails to
+parse, the client receives it as plain text and ends the session.** Every malformed
+call the model writes is therefore fatal unless the server can do something with it.
+Each fix below came from a real run that died that way, and each one keeps the rule of
+never inventing a value. A call is either repaired structurally or passed on incomplete,
+so the client rejects it and the model retries:
+
+- the same parameter sent twice with the same value: duplicates dropped;
+- a required parameter sent twice with different values: left out (no guessing which);
+- a parameter the tool doesn't take, sent with conflicting values: left out;
+- a call left open when the next one starts: closed after its finished parameters;
+- a call cut off by the loop guard: kept with its finished parameters.
+
+The **loop guard** stops generation when the last 200 characters already appeared 4
+times in the last 6,000, which catches a model repeating itself. We started with
+[greedy decoding](https://huggingface.co/blog/how-to-generate) (always the most likely
+token), which can repeat a failed edit forever; replays showed that
+[sampling](https://huggingface.co/blog/how-to-generate) at temperature 1.0, DeepSeek's
+own recommendation, breaks such streaks, so agent runs now sample.
+
+### 5. Writing fewer tokens: testing the agent
+
+To change anything with confidence we needed a repeatable test. **Test B** asks the
+agent for a real feature in a small macOS menu-bar app (Swift): store notes by desktop ID
+instead of desktop number, migrate existing notes, add a helper, and write tests, with
+five numbered steps and several "and also" clauses. **Test C** is a Python change to a
+text-chunking module with 18 clauses, scored by a hidden grader the agent never sees.
+`opencode_run.sh` runs a test unattended (and refuses to start if another OpenCode
+session could interfere), and each change was judged on batches of four runs. That is a
+small sample: run times for the same task vary by 2x, so only large differences count.
+
+What helped, in order:
+
+1. **A self-check rule.** The model kept missing half of a two-part requirement. A rule
+   telling it to *quote every clause of the task, word for word, next to the line of code
+   that does it* took that requirement from 3 of 7 runs to 22 of 23. A weaker "check every
+   clause" left it paraphrasing away the very clause it had missed.
+2. **Rules added by the proxy.** OpenCode 2.2.6 ignores `AGENTS.md`, so the rules had to
+   be pasted into every task. `record_proxy.py --rules` now adds them to every agent turn.
+3. **An edit rule, and filling a missing edit path.** A quarter of all generated tokens
+   went into edit calls OpenCode rejected, most for a missing file `path`, and each
+   rejection makes the model rewrite the whole edit. A rule ("every edit call gives path
+   first, then oldString, then newString") helped, but how often the model forgets the
+   path varies a lot from run to run. With `--fill-edit-path` the proxy adds the path when
+   exactly one file the session has seen contains the edit's old text. This is the one
+   place a value is filled in, so it was checked first against recordings (51 of 53 cases
+   right, none wrong), and none of the 33 fills checked in later runs went to the wrong file.
+4. **"Keep text before a tool call under 50 words."** When stuck, the model wrote long
+   analyses before cheap calls; in one batch, half of all tokens were in turns that only
+   read a file or ran a command.
+
+| Test B, 4 runs | Total time | Tokens written |
+|---|---|---|
+| Self-check rule, added by the proxy (1, 2) | 47.2 min | 69k |
+| + edit rule and path filling (3) | 35.4 min | 51k |
+| + 50-word rule (4) | **29.3 min** | **42k** |
+
+What didn't help: thinking mode (no gain), a rule to test every limit at its boundary
+(no gain, and two runs got worse), and a stronger 50-word rule that added "when stuck,
+read the code or run the tests instead": faster still, but the model then deleted
+existing tests to make failures go away, in every run. Rules make the model recheck what
+it already sees; they don't make it notice a meaning it missed. For that, the task text
+has to spell it out.
+
+### 6. Writing tokens faster: two experiments that didn't pay off
+
+**Speculative decoding** ([Leviathan et al.](https://arxiv.org/abs/2211.17192)) uses a
+small, fast "drafter" to guess several next tokens, then checks all the guesses with one
+pass of the big model, keeping the ones it agrees with. It helps when checking k tokens
+costs about the same as producing one. DeepSeek-V4-Flash-0731 ships its own drafter, a
+"DSpark" head that guesses 5 tokens at a time from the model's internal states, related
+to [multi-token prediction](https://arxiv.org/abs/2404.19737) as used in
+[DeepSeek-V3](https://arxiv.org/abs/2412.19437). Getting it to run across two machines
+took two fixes (`bench_mtp.py`), and it was correct and accurate: up to 4.6 tokens
+accepted per round. But it was slower, 24.8 against 28.8 tok/s, because checking 5
+tokens took 155 ms against 29 ms for one. In an MoE model each token goes to its own
+experts, so checking 5 tokens reads close to 5 times the expert weights, and decode is
+limited by reading weights: there is nothing to win.
+
+**Tensor parallelism** ([Megatron-LM](https://arxiv.org/abs/1909.08053)) splits every
+layer across both machines instead of splitting the layer stack. Both machines then work
+on every token and each reads only half of each layer, so in principle it is up to twice
+as fast. The price is that the halves have to be combined inside every layer with an
+[all-reduce](https://en.wikipedia.org/wiki/Collective_operation) (`all_sum`): 86 per token
+for this model. mlx-vlm supports it, and it ran correctly at 73.2 GiB per machine, but
+decoded at 18.7 tok/s against 29.3. A bare `all_sum` over the link takes about 20 µs;
+one that follows GPU work takes 170-210 µs, most likely because the GPU has to finish
+and hand over to the CPU first. 86 of those per token outweigh the half of the weight
+reading saved. If MLX could make that handoff close to the bare time, tensor parallelism
+would by our estimate reach about 50 tok/s; that is a question for MLX itself.
+
+### 7. Where that leaves things
+
+Decoding at ~29 tok/s is close to what this hardware and software can do; the speed-ups
+that worked came from the agent writing fewer, better-aimed tokens. The model still
+misses an occasional requirement (about 1 run in 4 in recent Test B batches), so its work needs
+reviewing, but a typical Test B run now finishes unattended in about 7 minutes with all
+tests passing.
+
 ## Before any cluster run
 
 These reset on every reboot. Check them first.
