@@ -144,6 +144,10 @@ def main():
     ap.add_argument("--diag", action="store_true", help="stop after the warm-up")
     ap.add_argument("--trace", action="store_true", help="per-rank call trace and stack dumps")
     ap.add_argument("--time-parts", action="store_true", help="time verify and drafter separately")
+    ap.add_argument("--tensor", action="store_true", help="tensor parallel (tensor_group) instead of pipeline")
+    ap.add_argument("--allsum-bench", action="store_true", help="time small all_sums before loading")
+    ap.add_argument("--prefault", action="store_true", help="touch every weight before the warm-up")
+    ap.add_argument("--save-text", default="", help="rank 0 writes each run's output to PREFIX-<label>.txt")
     ap.add_argument("--only", choices=["greedy-draft", "greedy"], help="greedy-draft: drafter only; "
                     "greedy: base greedy, then the drafter at each --blocks size")
     ap.add_argument("--blocks", default="", help="comma list of draft block sizes for --only greedy")
@@ -164,7 +168,31 @@ def main():
         print(f"[rank {world.rank()}] {stage}: active {mx.get_active_memory() / gib:.1f} GiB, "
               f"peak {mx.get_peak_memory() / gib:.1f} GiB", flush=True)
 
-    model, processor = sharded_load(args.model, pipeline_group=world)
+    if args.allsum_bench:
+        for shape in ((1, 1, 4096), (1, 1, 4, 4096), (1, 512, 4096)):
+            x = mx.ones(shape, dtype=mx.bfloat16)
+            mx.eval(mx.distributed.all_sum(x))
+            t0 = time.perf_counter()
+            for _ in range(200):
+                mx.eval(mx.distributed.all_sum(x))
+            one = (time.perf_counter() - t0) / 200
+            t0 = time.perf_counter()
+            y = x
+            for _ in range(86):  # one token's worth, chained in one graph
+                y = mx.distributed.all_sum(y) * 0.5
+            mx.eval(y)
+            chain = time.perf_counter() - t0
+            say(f"all_sum {shape} bf16 ({x.nbytes / 1024:.0f} KiB): {one * 1e6:.0f} us each with a sync; "
+                f"86 chained: {chain * 1e3:.1f} ms")
+    if args.tensor:
+        # mlx-vlm 0.7.12 defines shard() on DeepSeek-V4's LanguageModel, but sharded_load
+        # looks for it on the outer Model and refuses tensor parallelism without it.
+        import mlx_vlm.models.deepseek_v4.deepseek_v4 as dsv4_top
+        if not hasattr(dsv4_top.Model, "shard"):
+            dsv4_top.Model.shard = lambda self, group=None: self.language_model.shard(group)
+        model, processor = sharded_load(args.model, tensor_group=world)
+    else:
+        model, processor = sharded_load(args.model, pipeline_group=world)
     mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])  # as the server
     mem("model loaded")
     draft, kind = (None, None) if args.no_draft else load_drafter(args.draft)
@@ -177,6 +205,15 @@ def main():
         mx.eval(draft.parameters())
         validate_drafter_compatibility(model, draft, kind)
     mem("drafter loaded")
+    if args.prefault:
+        # As the server: touch every weight, one tensor per command buffer, then wait for
+        # the other rank, so no GPU buffer pages in more than one tensor (GPU timeout otherwise).
+        from mlx.utils import tree_flatten
+        t0 = time.perf_counter()
+        for _, prm in tree_flatten(model.parameters()):
+            mx.eval(prm.sum())
+        print(f"[rank {world.rank()}] prefaulted in {time.perf_counter() - t0:.1f}s", flush=True)
+        mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
     mx.eval(mx.distributed.all_sum(mx.array(1.0)))  # both ranks here before any pipeline traffic
     say(f"loaded; drafter kind {kind}; ranks {world.size()}")
     run(model, processor, "Hi", 4, 0.0, 0)  # warm-up, as the server does
@@ -212,6 +249,9 @@ def main():
                         k = next((i for i, (a, b) in enumerate(zip(toks, base_greedy)) if a != b),
                                  min(len(toks), len(base_greedy)))
                         extra += f" | greedy match: {same}" + ("" if same else f" (first diff at char {k})")
+                if args.save_text and world.rank() == 0:
+                    with open(f"{args.save_text}-{label.replace(' ', '_')}.txt", "w") as f:
+                        f.write(toks)
                 say(f"{label}: {n} tokens, {tps:.1f} tok/s (decode wall), "
                     f"prompt {last.prompt_tokens if last else '?'}{extra}")
                 for part, (cnt, tot) in sorted(PARTS.items()):

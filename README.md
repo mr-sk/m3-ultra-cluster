@@ -272,6 +272,24 @@ against 29 ms for one: each token routes to its own experts, so a 5-token pass r
 only pays when checking k tokens costs much less than k steps; here it can't beat
 plain decoding, so the server doesn't use it.
 
+The same script also tries tensor parallelism (`--tensor --prefault`): every layer
+split across both nodes instead of half the layers on each. mlx-vlm 0.7.12 supports
+it for DeepSeek-V4 (`sharded_load(..., tensor_group=...)`), but defines `shard()` on
+the inner LanguageModel, so the script adds a delegating `shard()` to the outer
+Model. Each node then holds 73.2 GiB (2.8 GiB is copied to both). Like the server,
+it needs every weight touched once before the warm-up, or the first pass hits a GPU
+timeout.
+
+| Split | tok/s (greedy, real 15k-token prompt) |
+|---|---|
+| Pipeline (what the server uses) | 29.3 |
+| Tensor parallel | 18.7 |
+
+Each token needs 86 all_sums in a row (two per layer). `--allsum-bench` times them:
+a bare all_sum of 8-32 KiB takes ~45 us, but 86 chained in one graph take 21-25 ms,
+~250 us each, mostly the GPU/CPU handoff around each collective rather than the
+link. At ~45 us each, tensor parallelism would be near 50 tok/s.
+
 ### record_proxy.py
 
 Sits between a client (OpenCode) and the server on 127.0.0.1 and saves each request
