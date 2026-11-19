@@ -262,6 +262,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `opencode_run.sh` | (any) | One unattended OpenCode run of a task prompt against a git repo, for repeatable agent tests |
 | `record_proxy.py` | (any, stdlib) | Recording proxy between a client and the server; can add working rules to every agent turn |
 | `bench_mtp.py` | `~/vlm-env` | Speculative decoding with DeepSeek-V4-Flash-0731's DSpark drafter on the pipelined cluster (experiment: no speedup) |
+| `allsum_repro.py` | `~/vlm-env` | Times JACCL all_sum alone vs after GPU work (why tensor parallelism loses) |
 
 The two venvs are separate on purpose. `~/cluster-env` has mlx-lm 0.32.2;
 `~/vlm-env` has mlx-vlm 0.7.12. Both pin mlx 0.32.4, which must match on both
@@ -503,10 +504,23 @@ timeout.
 | Pipeline (what the server uses) | 29.3 |
 | Tensor parallel | 18.7 |
 
-Each token needs 86 all_sums in a row (two per layer). `--allsum-bench` times them:
-a bare all_sum of 8-32 KiB takes ~45 us, but 86 chained in one graph take 21-25 ms,
-~250 us each, mostly the GPU/CPU handoff around each collective rather than the
-link. At ~45 us each, tensor parallelism would be near 50 tok/s.
+Each token needs 86 all_sums in a row (two per layer), each after GPU work.
+`allsum_repro.py` (standalone, launch it on both nodes) separates the costs, per
+all_sum of 8 / 32 KiB bfloat16:
+
+| Variant | 8 KiB | 32 KiB |
+|---|---|---|
+| all_sum of an already evaluated array | 18 us | 25 us |
+| GPU multiply, then all_sum, eval each | 212 us | 213 us |
+| the same, 86 chained in one graph (as in a forward pass) | 166 us | 182 us |
+| as above with the all_sum on `stream=mx.cpu` | 171 us | 180 us |
+| a GPU multiply alone, for comparison | 9 us | 9 us |
+
+So the cost is the handoff between GPU work and the collective, not the link or the
+chaining. At ~20 us each, tensor parallelism would by our estimate reach about 50
+tok/s. (`bench_mtp.py --allsum-bench` gives rougher numbers for the same thing.)
+Launch it with the server stopped and give the RDMA link ~15 s after stopping: an
+immediate start failed with `[jaccl] Changing queue pair to RTR failed with errno 14`.
 
 ### record_proxy.py
 
