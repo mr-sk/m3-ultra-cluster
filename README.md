@@ -271,6 +271,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 |---|---|---|
 | `vlm_cluster_server.py` | `~/vlm-env` | OpenAI-compatible chat server for an mlx-vlm model split across both nodes |
 | `split_test.py` | `~/vlm-env` | Offline check that the server's pipeline split runs every layer on exactly one rank |
+| `proto_interleave.py` | `~/vlm-env` | Prototype: two requests decoded at once, interleaved across the pipeline (1.87x combined throughput) |
 | `cluster_launch.py` | `~/cluster-env` | `mlx.launch` with its IO loop fixed so it doesn't spin ~1.7 cores while the job runs |
 | `needle_test.py` | `~/cluster-env` | Needle-in-a-haystack correctness test, Qwen3-Coder-Next via mlx-lm |
 | `dsv4_run.py` | `~/vlm-env` | Speed sweep + needle test for DeepSeek-V4-Flash via mlx-vlm |
@@ -536,6 +537,29 @@ chaining. At ~20 us each, tensor parallelism would by our estimate reach about 5
 tok/s. (`bench_mtp.py --allsum-bench` gives rougher numbers for the same thing.)
 Launch it with the server stopped and give the RDMA link ~15 s after stopping: an
 immediate start failed with `[jaccl] Changing queue pair to RTR failed with errno 14`.
+
+### proto_interleave.py: two requests at once (prototype)
+
+With one request at a time, each node idles half of every token: rank 1 runs layers
+0-20 while rank 0 waits, then rank 0 runs 21-42 while rank 1 waits. Batching two
+requests into one forward pass doesn't help this MoE model (each token reads its own
+experts, so 2 tokens cost ~2x). Interleaving does: each step, rank 1 runs its layers
+for one request while rank 0 runs its layers for the other, then a single
+`all_gather` swaps rank 1's hidden state and rank 0's sampled token (packed in
+float32), so neither side waits on a one-way send. Each request advances every two
+steps; both nodes are busy every step.
+
+On two real 15k-token prompts, 64 greedy tokens each (`--no-state-eval`):
+
+| | Combined tok/s | Per request |
+|---|---|---|
+| One at a time (this script's simple loop) | 26.6 | 26.6 |
+| Interleaved | 49.7 | 24.9 |
+
+Tokens were identical to one-at-a-time decoding for both requests. A step takes
+17.8 ms: the slower node's half (16.5 ms) plus ~1.5 ms. Evaluating every cache's
+`.state` each step (the script's default) made steps 44 ms; mlx-vlm's own generate
+doesn't do it. Not in the server yet.
 
 ### record_proxy.py
 
