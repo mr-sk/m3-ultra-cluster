@@ -30,6 +30,9 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
 - **DeepSeek tool-call fixes in the server** (`repeat_test.py`): identical or
   conflicting repeated DSML parameters, calls cut off by the loop guard, calls left
   open when the next one starts.
+- **All 43 layers run** (`split_test.py`): mlx-vlm 0.7.12's pipeline split drops a
+  layer when the layer count doesn't divide evenly; until 2026-11-19 layer 21 ran
+  nowhere. The server now installs mlx-lm's split (perplexity 6.20 to 6.02).
 - **Tried and not used:** speculative decoding with the model's own DSpark drafter
   (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
   both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
@@ -78,6 +81,17 @@ Studio holds the first half of the 43 layers, the other the second half. For eac
 orange runs its layers and hands the result to purple, which runs the rest and shares
 the output with every rank. Only a few small tensors cross the link per token. The cost is
 that each machine waits while the other works.
+
+The split itself had a bug, found late. mlx-vlm's `PipelineMixin.pipeline` (0.7.12, and
+`main` at the time of writing) computes each rank's first layer from that rank's own
+layer count, so when the layers don't divide evenly the ranges don't meet: with 43 layers
+on 2 ranks, rank 0 ran layers 22-42 and rank 1 ran 0-20, and **layer 21 was never loaded or
+run**, with no error. The model still wrote fluent, mostly correct code, so nothing looked
+wrong. Measured as the [perplexity](https://huggingface.co/docs/transformers/perplexity) of
+a fixed 3,071-token text, it was 6.20 with the layer missing and 6.02 with it back (tensor
+parallelism, which runs every layer, gave 6.04). The server now replaces the split with
+mlx-lm's, which assigns every layer to exactly one rank (`fixed_pipeline`, tested by
+`split_test.py`); rank 0 runs layers 21-42 and rank 1 runs 0-20.
 
 `vlm_cluster_server.py` turns this into an OpenAI-style chat API. Purple (rank 0) serves
 HTTP, and every request is broadcast to both ranks so they run the same generation in
@@ -256,6 +270,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | Script | Venv | What it does |
 |---|---|---|
 | `vlm_cluster_server.py` | `~/vlm-env` | OpenAI-compatible chat server for an mlx-vlm model split across both nodes |
+| `split_test.py` | `~/vlm-env` | Offline check that the server's pipeline split runs every layer on exactly one rank |
 | `cluster_launch.py` | `~/cluster-env` | `mlx.launch` with its IO loop fixed so it doesn't spin ~1.7 cores while the job runs |
 | `needle_test.py` | `~/cluster-env` | Needle-in-a-haystack correctness test, Qwen3-Coder-Next via mlx-lm |
 | `dsv4_run.py` | `~/vlm-env` | Speed sweep + needle test for DeepSeek-V4-Flash via mlx-vlm |

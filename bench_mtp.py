@@ -85,6 +85,37 @@ def _shared_capture_call(self, inputs, cache=None, inputs_embeds=None, hidden_si
 
 dsv4_lang.DeepseekV4Model.__call__ = _shared_capture_call
 
+
+def fixed_pipeline(self, group):
+    """mlx-lm 0.32.2's split. mlx-vlm 0.7.12's formula drops a layer when the layer count
+    doesn't divide evenly (43 layers on 2 ranks: layer 21 runs nowhere)."""
+    self.pipeline_rank, self.pipeline_size = group.rank(), group.size()
+    base, extra = divmod(len(self.layers), self.pipeline_size)
+    split = [base + (1 if r < extra else 0) for r in range(self.pipeline_size)]
+    self.start_idx = sum(split[self.pipeline_rank + 1:])
+    self.end_idx = self.start_idx + split[self.pipeline_rank]
+    self.layers = self.layers[: self.end_idx]
+    self.layers[: self.start_idx] = [None] * self.start_idx
+
+
+def mean_nll(model, processor, text, n_tokens):
+    """Average negative log-likelihood per token of `text`, read in 512-token chunks."""
+    from mlx_vlm.models import cache as vcache
+    tok = getattr(processor, "tokenizer", processor)
+    ids = tok.encode(text)[:n_tokens]
+    lm = model.language_model
+    c = vcache.make_prompt_cache(lm)
+    total, n = 0.0, 0
+    for s in range(0, len(ids) - 1, 512):
+        chunk = ids[s:s + 512]
+        targets = ids[s + 1:s + 1 + len(chunk)]
+        out = lm(mx.array(chunk)[None], cache=c)
+        lg = out.logits[0, :len(targets)].astype(mx.float32)
+        nll = mx.logsumexp(lg, axis=-1) - mx.take_along_axis(lg, mx.array(targets)[:, None], axis=-1)[:, 0]
+        total += nll.sum().item()
+        n += len(targets)
+    return total / n, n
+
 PARTS = {}
 
 
@@ -147,8 +178,11 @@ def main():
     ap.add_argument("--tensor", action="store_true", help="tensor parallel (tensor_group) instead of pipeline")
     ap.add_argument("--allsum-bench", action="store_true", help="time small all_sums before loading")
     ap.add_argument("--prefault", action="store_true", help="touch every weight before the warm-up")
+    ap.add_argument("--fix-split", action="store_true", help="mlx-lm's pipeline split (no dropped layer)")
+    ap.add_argument("--nll", default="", help="score this text file: mean negative log-likelihood per token")
+    ap.add_argument("--nll-tokens", type=int, default=3072)
     ap.add_argument("--save-text", default="", help="rank 0 writes each run's output to PREFIX-<label>.txt")
-    ap.add_argument("--only", choices=["greedy-draft", "greedy"], help="greedy-draft: drafter only; "
+    ap.add_argument("--only", choices=["greedy-draft", "greedy", "nll"], help="greedy-draft: drafter only; "
                     "greedy: base greedy, then the drafter at each --blocks size")
     ap.add_argument("--blocks", default="", help="comma list of draft block sizes for --only greedy")
     ap.add_argument("prompts", nargs="*")
@@ -184,6 +218,9 @@ def main():
             chain = time.perf_counter() - t0
             say(f"all_sum {shape} bf16 ({x.nbytes / 1024:.0f} KiB): {one * 1e6:.0f} us each with a sync; "
                 f"86 chained: {chain * 1e3:.1f} ms")
+    if args.fix_split:
+        import mlx_vlm.models.pipeline as vpipe
+        vpipe.PipelineMixin.pipeline = fixed_pipeline
     if args.tensor:
         # mlx-vlm 0.7.12 defines shard() on DeepSeek-V4's LanguageModel, but sharded_load
         # looks for it on the outer Model and refuses tensor parallelism without it.
@@ -194,6 +231,11 @@ def main():
     else:
         model, processor = sharded_load(args.model, pipeline_group=world)
     mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])  # as the server
+    inner = model.language_model.model
+    if not args.tensor:
+        held = [i for i, l in enumerate(inner.layers) if l is not None and inner.start_idx <= i < (inner.end_idx or 10**9)]
+        print(f"[rank {world.rank()}] layers {inner.start_idx}..{inner.end_idx} -> holds {len(held)}: "
+              f"{held[0]}-{held[-1]}", flush=True)
     mem("model loaded")
     draft, kind = (None, None) if args.no_draft else load_drafter(args.draft)
     if draft is not None:
@@ -218,7 +260,10 @@ def main():
     say(f"loaded; drafter kind {kind}; ranks {world.size()}")
     run(model, processor, "Hi", 4, 0.0, 0)  # warm-up, as the server does
     mem("after warm-up")
-    if args.diag:
+    if args.nll:
+        nll, n = mean_nll(model, processor, open(args.nll).read(), args.nll_tokens)
+        say(f"NLL over {n} tokens: {nll:.4f} nats/token (perplexity {__import__('math').exp(nll):.3f})")
+    if args.diag or args.only == "nll":
         return
     if args.time_parts:
         install_timers()

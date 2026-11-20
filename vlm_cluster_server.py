@@ -1218,6 +1218,25 @@ def make_handler(world, model, processor, config, model_id):
     return Handler
 
 
+def fixed_pipeline(self, group):
+    """Pipeline split in which every layer runs on exactly one rank (mlx-lm 0.32.2's).
+
+    mlx-vlm 0.7.12's PipelineMixin.pipeline gives each rank ceil or floor of
+    layers/ranks but computes start_idx from that rank's own count, so when the
+    layers don't divide evenly one layer runs nowhere. DeepSeek-V4-Flash has 43
+    layers: on 2 ranks layer 21 was never loaded or run (2026-11-19). Measured on
+    a 3,071-token text: 1.8246 nats/token with the dropped layer, 1.7956 with it
+    back (tensor parallel, all layers: 1.7986). Rank 0 still runs the last layers.
+    """
+    self.pipeline_rank, self.pipeline_size = group.rank(), group.size()
+    base, extra = divmod(len(self.layers), self.pipeline_size)
+    split = [base + (1 if r < extra else 0) for r in range(self.pipeline_size)]
+    self.start_idx = sum(split[self.pipeline_rank + 1:])
+    self.end_idx = self.start_idx + split[self.pipeline_rank]
+    self.layers = self.layers[: self.end_idx]
+    self.layers[: self.start_idx] = [None] * self.start_idx
+
+
 PIN_WEIGHTS = True  # --no-pin-weights
 STOCK_WIRED_LIMIT = importlib.import_module("mlx_vlm.generate.common").wired_limit
 
@@ -1297,7 +1316,13 @@ def main():
     rank = world.rank()
     t0 = time.perf_counter()
     if world.size() > 1:
+        import mlx_vlm.models.pipeline as vlm_pipeline
+        vlm_pipeline.PipelineMixin.pipeline = fixed_pipeline
         model, processor = sharded_load(args.model, pipeline_group=world)
+        inner = getattr(model.language_model, "model", model.language_model)
+        if hasattr(inner, "start_idx"):
+            log(f"rank {rank}: runs layers {inner.start_idx}-{inner.end_idx - 1} "
+                f"({inner.end_idx - inner.start_idx} of the model's layers)")
     else:
         model, processor = load(args.model)
     config = model.config.to_dict() if hasattr(model.config, "to_dict") else model.config
