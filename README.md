@@ -272,6 +272,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `vlm_cluster_server.py` | `~/vlm-env` | OpenAI-compatible chat server for an mlx-vlm model split across both nodes |
 | `split_test.py` | `~/vlm-env` | Offline check that the server's pipeline split runs every layer on exactly one rank |
 | `proto_interleave.py` | `~/vlm-env` | Prototype: two requests decoded at once, interleaved across the pipeline (1.87x combined throughput) |
+| `profile_half.py`, `active_bytes.py` | `~/vlm-env` / any | Where each rank's half of a decoded token spends its time, against the bandwidth floor |
 | `cluster_launch.py` | `~/cluster-env` | `mlx.launch` with its IO loop fixed so it doesn't spin ~1.7 cores while the job runs |
 | `needle_test.py` | `~/cluster-env` | Needle-in-a-haystack correctness test, Qwen3-Coder-Next via mlx-lm |
 | `dsv4_run.py` | `~/vlm-env` | Speed sweep + needle test for DeepSeek-V4-Flash via mlx-vlm |
@@ -560,6 +561,29 @@ Tokens were identical to one-at-a-time decoding for both requests. A step takes
 17.8 ms: the slower node's half (16.5 ms) plus ~1.5 ms. Evaluating every cache's
 `.state` each step (the script's default) made steps 44 ms; mlx-vlm's own generate
 doesn't do it. Not in the server yet.
+
+### profile_half.py, active_bytes.py: where a decoded token's time goes
+
+`active_bytes.py` (headers only) puts the weights read per token at 4.84 GB on rank 1
+(layers 0-20) and 5.67 GB on rank 0 (21-42 and the output layer): a floor of 6-9 ms
+per half at 600-800 GB/s. `profile_half.py` times each rank's half alone at an 8k-token
+context:
+
+| | Rank 1 | Rank 0 |
+|---|---|---|
+| Synced / CPU building ahead | 17.2 / 15.8 ms | 19.0 / 17.2 ms |
+| Attention | 11.9 ms | 13.0 ms |
+| Experts | 7.6 ms | 7.5 ms |
+| Sparse compressed attention (1:4, indexer), per layer | 0.72 ms (10 layers) | 0.76 ms (11) |
+| Compressed attention (1:128), per layer | 0.43 ms (9) | 0.42 ms (11) |
+| Sliding-window attention, per layer | 0.42 ms (2) | - |
+
+So each half runs at about half its bandwidth floor, and attention is ~60% of it; even
+the simplest attention layer takes 0.42 ms against ~0.19 ms of weight reads. mlx-vlm's
+DeepSeek-V4 code already uses custom Metal kernels and `mx.compile`, and single-token
+decode takes the fused paths. If attention ran at memory speed, decode would be ~50
+tok/s instead of ~29; that would take faster attention kernels, mainly for the
+sparse-indexed layers.
 
 ### record_proxy.py
 
