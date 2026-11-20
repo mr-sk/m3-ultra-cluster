@@ -272,6 +272,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `vlm_cluster_server.py` | `~/vlm-env` | OpenAI-compatible chat server for an mlx-vlm model split across both nodes |
 | `split_test.py` | `~/vlm-env` | Offline check that the server's pipeline split runs every layer on exactly one rank |
 | `proto_interleave.py` | `~/vlm-env` | Prototype: two requests decoded at once, interleaved across the pipeline (1.87x combined throughput) |
+| `interleave_test.py` | `~/vlm-env` | Offline check of the server's interleaved scheduling (`--concurrent 2`) with two fake ranks |
 | `profile_half.py`, `active_bytes.py` | `~/vlm-env` / any | Where each rank's half of a decoded token spends its time, against the bandwidth floor |
 | `cluster_launch.py` | `~/cluster-env` | `mlx.launch` with its IO loop fixed so it doesn't spin ~1.7 cores while the job runs |
 | `needle_test.py` | `~/cluster-env` | Needle-in-a-haystack correctness test, Qwen3-Coder-Next via mlx-lm |
@@ -560,7 +561,24 @@ On two real 15k-token prompts, 64 greedy tokens each (`--no-state-eval`):
 Tokens were identical to one-at-a-time decoding for both requests. A step takes
 17.8 ms: the slower node's half (16.5 ms) plus ~1.5 ms. Evaluating every cache's
 `.state` each step (the script's default) made steps 44 ms; mlx-vlm's own generate
-doesn't do it. Not in the server yet.
+doesn't do it.
+
+**In the server: `--concurrent 2`** (off by default). Rank 0's HTTP handlers run in
+their own threads and queue jobs for an engine on the main thread, the only thread
+that uses MLX; rank 1 follows. Both ranks run the same protocol: a "change"
+broadcast (finished requests, jobs to admit), prefill and first token for each new
+job (with the usual prompt-cache snapshots, done by the engine itself because
+mlx-vlm's `generate_step` runs one token ahead), a "go" broadcast, then interleaved
+decoding until rank 0 calls for an event (a request finished, or one is waiting).
+Rank 0 alone samples after the first token, applies the stop checks and the loop
+guard, and streams. The scheduling is tested offline by `interleave_test.py` (two
+fake ranks as threads; 40 random runs of request lengths and event timings).
+
+Live, two recorded agent requests (17-20k-token prompts, greedy, 96 tokens): output
+identical to normal mode alone and with both at once. Decode: normal mode 29.1-29.4
+tok/s; two at once 24.2-24.4 tok/s each (about 48.6 combined, 1.66x); one request in
+concurrent mode 24.4 tok/s, 17% below normal mode (two exchanges per token and no
+building ahead).
 
 ### profile_half.py, active_bytes.py: where a decoded token's time goes
 

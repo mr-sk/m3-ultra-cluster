@@ -41,7 +41,10 @@ import socket
 import sys
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+import queue as _queue
+import threading
+from types import SimpleNamespace
 
 # macOS drops GPU residency after ~2 s idle (a macOS bug; ml-explore/mlx#4633).
 # This makes MLX re-request it every second. MLX reads it when it creates the
@@ -55,6 +58,12 @@ import numpy as np
 from mlx_vlm import stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load, sharded_load
+from mlx_vlm.models import cache as _vlm_cache
+from mlx_vlm.models.base import create_attention_mask as _create_attention_mask
+from mlx_vlm.models.cache import CacheList as _CacheList
+from mlx_vlm.models.linear import linear as _linear
+from mlx_vlm.sample_utils import make_sampler as _make_sampler
+from mlx_vlm.tokenizer_utils import make_streaming_detokenizer as _make_detokenizer
 import importlib
 # mlx_vlm rebinds the name `mlx_vlm.generate` to a function, so load by full name.
 _dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
@@ -1010,6 +1019,314 @@ def apply_stop(text, stops):
 
 # --------------------------------------------------------------------- server
 
+# ------------------------------------------------ two requests at once (--concurrent 2)
+#
+# With one request at a time each rank idles half of every decoded token: rank 1
+# runs the first layers while rank 0 waits, then the reverse. With --concurrent 2
+# two requests are decoded interleaved: each step rank 1 runs its layers for one
+# request while rank 0 runs its layers for the other, then one all_gather swaps
+# rank 1's hidden state and rank 0's sampled token (proto_interleave.py: 1.87x the
+# combined throughput, tokens identical to one at a time). Only the engine thread
+# uses MLX; on rank 0 the HTTP handlers run in their own threads and hand jobs over
+# through ENGINE_QUEUE. Prefill is done here rather than by stream_generate:
+# generate_step works one token ahead, so stopping it after the first token would
+# leave that token's KV in the cache before we feed it again.
+#
+# Protocol, identical on every rank: "change" (finished slots, jobs to admit) ->
+# admit each job (prefill + first token, sampled with the job's seed as usual) ->
+# "go" (slots that finished on their first token) -> interleave() until rank 0
+# calls for an event -> "change" again. Rank 0 alone samples after the first
+# token, decides when a request stops, and streams it.
+
+CONCURRENT = 1        # --concurrent
+ENGINE_QUEUE = None   # rank 0: (job, events queue, cancel Event); None to shut down
+
+
+class Slot:
+    """One request being decoded. Every rank keeps a Slot per request with the same tokens."""
+
+    def __init__(self, sid, first_token):
+        self.sid = sid
+        self.tokens = [first_token]
+        self.finished = False
+
+
+def interleave(rank, lanes, first_half, second_half, exchange, on_token=None, want_event=None):
+    """Decode up to two requests at once on a 2-rank pipeline, until rank 0 calls for an event.
+
+    Runs on both ranks with the same `lanes` ([slot, slot-or-None]). Each step rank 1
+    runs the first layers for lane (step % 2) while rank 0 runs the last layers for the
+    slot rank 1 worked on the step before, samples its next token and decides whether
+    it stops. One exchange per step carries rank 1's hidden state and rank 0's token
+    and control flag to both ranks. When rank 0 sets the flag (a slot finished, or
+    want_event() says a request is waiting), one "drain" step finishes the hidden state
+    still in flight, so nothing is pending on return. Rank 0 appends tokens in
+    on_token(slot, token) -> stop?; rank 1 appends the same tokens from the exchange.
+    Tested offline by interleave_test.py.
+    """
+    pending = None
+    received = None
+    draining = False
+    step = 0
+    while True:
+        lane = None if draining else lanes[step % 2]
+        if lane is not None and lane.finished:
+            lane = None
+        hidden = first_half(lane) if rank == 1 and lane is not None else None
+        token, control = None, 0
+        if rank == 0 and pending is not None:
+            token = second_half(pending, received)
+            if on_token(pending, token):
+                control = 1
+        if rank == 0 and not draining and want_event is not None and want_event():
+            control = 1
+        token_seen, control_seen, hidden_seen = exchange(hidden, token, control)
+        if rank == 1 and pending is not None:
+            pending.tokens.append(token_seen)
+        step += 1
+        if draining:
+            return step
+        if control_seen:
+            draining = True
+        pending, received = lane, hidden_seen
+        if pending is None and draining:
+            return step
+
+
+def _layers_here(inner, ids, h, caches):
+    """This rank's layers for one request, as DeepseekV4Model.__call__ runs them (text only)."""
+    if h is None:  # the rank with the first layers embeds the token
+        h = inner.embed_tokens(ids)
+        h = mx.contiguous(mx.broadcast_to(h[:, :, None, :],
+                                          (h.shape[0], h.shape[1], inner.args.hc_mult, h.shape[2])))
+    first = caches[0]
+    mask = _create_attention_mask(h[:, :, 0, :], first[0] if isinstance(first, _CacheList) else first,
+                                  window_size=inner.args.sliding_window, return_array=True)
+    for layer, c in zip(inner.pipeline_layers, caches):
+        h = layer(h, mask, c, ids, causal=True)
+    return h
+
+
+def _prefill(model, processor, job, on_start=None):
+    """Prompt-cache lookup, chunked prefill with the usual snapshots, and the first token's
+    logits. Runs on every rank in lockstep, like stream_generate's prefill."""
+    lm = model.language_model
+    ids = _orig_prepare(model, processor, job["prompt"], None, None, None, {})[0].flatten().tolist()
+    use_cache = job.get("cache", True) and PROMPT_CACHE
+    reused, cache = 0, None
+    if use_cache:
+        best = None
+        for snap in SNAPS:
+            n = len(snap["ids"])
+            if n < len(ids) and (best is None or n > len(best["ids"])) and ids[:n] == snap["ids"]:
+                best = snap
+        if best is not None:
+            _tick[0] += 1
+            best["used"] = _tick[0]
+            cache = copy.deepcopy(best["cache"])
+            mx.eval([c.state for c in cache])
+            reused = len(best["ids"])
+    if cache is None:
+        cache = _vlm_cache.make_prompt_cache(lm)
+    if on_start is not None:
+        on_start(len(ids), reused)
+    rest = ids[reused:]
+    points = _checkpoint_lengths(ids, reused, len(rest)) if use_cache else []
+    step = job.get("prefill_step", PREFILL_STEP)
+    done, target, snaps = 0, len(rest) - 1, 0
+    while done < target:
+        end = min(done + step, target)
+        if points and points[0] > done:
+            end = min(end, points[0])
+        lm(mx.array(rest[done:end])[None], cache=cache, skip_logits=True)
+        mx.eval([c.state for c in cache])
+        done = end
+        if points and done == points[0]:
+            _add_snapshot(ids[: reused + done], cache)
+            snaps += 1
+            points.pop(0)
+    logits = lm(mx.array(rest[-1:])[None], cache=cache).logits[:, -1, :]
+    return ids, reused, snaps, cache, logits
+
+
+class Engine:
+    """Runs on every rank's main thread; rank 0 also streams to the waiting handlers."""
+
+    def __init__(self, world, model, processor):
+        self.world, self.model, self.processor = world, model, processor
+        self.rank = world.rank()
+        self.lm = model.language_model
+        self.inner = self.lm.model
+        self.tok = getattr(processor, "tokenizer", processor)
+        self.hdt = self.inner.embed_tokens(mx.array([[0]])).dtype
+        self.shape = (1, 1, self.inner.args.hc_mult, self.inner.args.hidden_size)
+        self.slots = []
+        self.next_sid = 0
+        self.side = {}  # rank 0: sid -> (events queue, cancel Event)
+
+    # --- per-step pieces for interleave()
+    def first_half(self, slot):
+        return _layers_here(self.inner, mx.array([[slot.tokens[-1]]]), None, slot.cache)
+
+    def second_half(self, slot, hidden):
+        h = _layers_here(self.inner, mx.array([[slot.tokens[-1]]]), hidden.astype(self.hdt), slot.cache)
+        logits = _linear(self.lm.lm_head, self.inner.norm(self.inner.hc_head(h)))[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return int(slot.sampler(logprobs).item())
+
+    def exchange(self, hidden, token, control):
+        if self.rank == 0:
+            head = mx.array([-1.0 if token is None else float(token), float(control)], dtype=mx.float32)
+            payload = mx.concatenate([head, mx.zeros((self.shape[2] * self.shape[3] - 2,), mx.float32)])
+            payload = payload.reshape(self.shape)
+        else:
+            payload = mx.zeros(self.shape, mx.float32) if hidden is None else hidden.astype(mx.float32)
+        g = mx.distributed.all_gather(payload, group=self.world)
+        mx.eval(g)
+        row0 = g[0].reshape(-1)
+        t, c = int(row0[0].item()), int(row0[1].item())
+        return (None if t < 0 else t), c, g[1:2]
+
+    # --- rank 0: what happens to each sampled token
+    def accept(self, slot, token):
+        """Stop checks, detokenizing and streaming for one token, as run_job does. Rank 0 only."""
+        job = slot.job
+        events, cancel = self.side[slot.sid]
+        if self.tok.stopping_criteria(token):
+            return self.finish(slot, "stop")
+        slot.detok.add_token(token, skip_special_token_ids=[])
+        seg = slot.detok.last_segment
+        slot.text += seg
+        slot.n += 1
+        events.put(("chunk", SimpleNamespace(text=seg, token=token)))
+        marker = job.get("stop_marker")
+        if marker and marker in slot.text:
+            return self.finish(slot, "stop")
+        if slot.n % LOOP_EVERY == 0 and looping(slot.text):
+            job["_looped"] = True
+            return self.finish(slot, "loop")
+        if slot.n >= job["max_tokens"] or cancel.is_set():
+            return self.finish(slot, "length")
+        return False
+
+    def on_token(self, slot, token):
+        slot.tokens.append(token)
+        return self.accept(slot, token)
+
+    def finish(self, slot, why):
+        global LAST_JOB_END
+        slot.finished = True
+        events, _ = self.side.pop(slot.sid)
+        slot.detok.finalize()
+        if slot.detok.last_segment:
+            slot.text += slot.detok.last_segment
+            events.put(("chunk", SimpleNamespace(text=slot.detok.last_segment, token=None)))
+        job = slot.job
+        job["_text"], job["_reused"], job["_new_snaps"] = slot.text, slot.reused, slot.snaps
+        LAST_JOB_END = time.monotonic()
+        dt = time.perf_counter() - slot.t_decode
+        events.put(("done", SimpleNamespace(prompt_tokens=slot.prompt_tokens, generation_tokens=slot.n,
+                                            prompt_tps=slot.prompt_tps,
+                                            generation_tps=slot.n / dt if dt > 0 else 0.0)))
+        return True
+
+    # --- both ranks
+    def admit(self, sid, job, on_start=None):
+        if job.get("prefault"):
+            n, dt, waited = prefault(self.model, cpu_barrier)
+            log(f"rank {self.rank}: paged in {n} weight tensors in {dt:.1f}s, then waited {waited:.1f}s")
+        mx.random.seed(job["seed"])  # same seed everywhere, so the first token matches
+        t0 = time.perf_counter()
+        ids, reused, snaps, cache, logits = _prefill(self.model, self.processor, job, on_start)
+        sampler = _make_sampler(temp=job["temperature"], top_p=job["top_p"])
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        first = int(sampler(logprobs).item())
+        slot = Slot(sid, first)
+        slot.job, slot.cache, slot.sampler = job, cache, sampler
+        slot.prompt_tokens, slot.reused, slot.snaps = len(ids), reused, snaps
+        slot.prompt_tps = len(ids) / max(time.perf_counter() - t0, 1e-9)
+        slot.t_decode = time.perf_counter()
+        slot.text, slot.n = "", 0
+        if self.rank == 0:
+            slot.detok = _make_detokenizer(self.processor)
+            self.accept(slot, first)
+        return slot
+
+    def decode(self):
+        live = [s for s in self.slots if not s.finished]
+        if not live:
+            return
+        lanes = [live[0], live[1] if len(live) > 1 else None]
+        if self.rank == 0:
+            def want_event():  # a waiting request and room for it (cancel is handled per token)
+                return len(live) < CONCURRENT and not ENGINE_QUEUE.empty()
+            interleave(0, lanes, None, self.second_half, self.exchange, self.on_token, want_event)
+        else:
+            interleave(1, lanes, self.first_half, None, self.exchange)
+
+    def run_rank0(self):
+        while True:
+            finished = [s.sid for s in self.slots if s.finished]
+            self.slots = [s for s in self.slots if not s.finished]
+            admits = []
+            if not self.slots:
+                item = ENGINE_QUEUE.get()
+                if item is None:
+                    broadcast(self.world, {"cmd": "shutdown"})
+                    return
+                admits.append(item)
+            while len(self.slots) + len(admits) < CONCURRENT:
+                try:
+                    item = ENGINE_QUEUE.get_nowait()
+                except _queue.Empty:
+                    break
+                if item is None:
+                    ENGINE_QUEUE.put(None)  # finish the current requests first
+                    break
+                admits.append(item)
+            plan = []
+            for job, events, cancel in admits:
+                sid = self.next_sid
+                self.next_sid += 1
+                self.side[sid] = (events, cancel)
+                plan.append((sid, job, events))
+            broadcast(self.world, {"cmd": "change", "finished": finished,
+                                   "admit": [[sid, job] for sid, job, _ in plan]})
+            for sid, job, events in plan:
+                try:
+                    slot = self.admit(sid, job, lambda total, reused, ev=events: ev.put(("start", (total, reused))))
+                except Exception as e:
+                    SNAPS.clear()
+                    events.put(("error", e))
+                    raise
+                self.slots.append(slot)
+            first_done = [s.sid for s in self.slots if s.finished]
+            broadcast(self.world, {"cmd": "go", "finished": first_done})
+            self.slots = [s for s in self.slots if not s.finished]
+            self.decode()
+
+    def run_follower(self):
+        while True:
+            cmd = broadcast(self.world)
+            if cmd.get("cmd") == "shutdown":
+                return
+            gone = set(cmd.get("finished", []))
+            self.slots = [s for s in self.slots if s.sid not in gone]
+            for sid, job in cmd.get("admit", []):
+                self.slots.append(self.admit(sid, job))
+            go = broadcast(self.world)
+            gone = set(go.get("finished", []))
+            self.slots = [s for s in self.slots if s.sid not in gone]
+            self.decode()
+
+
+def submit(job):
+    """Rank 0 handler threads: queue a job for the engine. Returns (events queue, cancel Event)."""
+    events, cancel = _queue.Queue(), threading.Event()
+    ENGINE_QUEUE.put((job, events, cancel))
+    return events, cancel
+
+
 def make_handler(world, model, processor, config, model_id):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1057,7 +1374,8 @@ def make_handler(world, model, processor, config, model_id):
             created = int(time.time())
 
             job["prefault"] = needs_prefault(time.monotonic(), LAST_JOB_END)
-            broadcast(world, job)  # every rank now starts the same job
+            if CONCURRENT <= 1:
+                broadcast(world, job)  # every rank now starts the same job
 
             state = {"text": "", "sent": 0, "rsent": 0, "stopped": False, "client_gone": False}
 
@@ -1121,7 +1439,26 @@ def make_handler(world, model, processor, config, model_id):
             def on_start(total, reused):
                 send_sse(chunk_obj({"reasoning_content": stats_start_line(total, reused)}))
 
-            last = run_job(model, processor, job, on_chunk, on_start if show_stats else None)
+            if CONCURRENT > 1:
+                # The engine thread decodes; this thread streams what it sends back.
+                events, cancel = submit(job)
+                last = None
+                while True:
+                    kind, val = events.get()
+                    if kind == "start":
+                        if show_stats:
+                            on_start(*val)
+                    elif kind == "chunk":
+                        on_chunk(val)
+                        if state["client_gone"]:
+                            cancel.set()
+                    elif kind == "done":
+                        last = val
+                        break
+                    else:
+                        raise val
+            else:
+                last = run_job(model, processor, job, on_chunk, on_start if show_stats else None)
             elapsed = time.perf_counter() - t0
             reasoning, src, think_done = split_think(state["text"], job["think"], final=True)
             topen_ = job["tool_open"]
@@ -1271,7 +1608,7 @@ def pin_weights():
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
     global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
-    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE
+    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE, CONCURRENT, ENGINE_QUEUE
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -1292,6 +1629,8 @@ def main():
     ap.add_argument("--default-reasoning-effort", default=DEFAULT_REASONING_EFFORT,
                     choices=["none", "low", "medium", "high", "max"],
                     help="thinking mode for requests that don't ask (DeepSeek-V4 only)")
+    ap.add_argument("--concurrent", type=int, default=1,
+                    help="decode up to this many requests at once, interleaved across the pipeline (1 or 2)")
     ap.add_argument("--wake-port", type=int, default=WAKE_PORT,
                     help="TCP port on rank 0 that wakes the other ranks for each job")
     ap.add_argument("--no-wake", action="store_true",
@@ -1307,6 +1646,7 @@ def main():
     STATS_IN_REASONING = not args.no_stats_in_reasoning
     RESAMPLE_ON_REPEAT = not args.no_resample_on_repeat
     PREFAULT_IDLE = args.prefault_idle
+    CONCURRENT = args.concurrent
     PIN_WEIGHTS = not args.no_pin_weights
     CACHE_MAX_SNAPS = args.cache_max_snapshots
     CACHE_BUDGET_TOKENS = args.cache_budget_tokens
@@ -1361,6 +1701,21 @@ def main():
                                "top_p": 1.0, "seed": 0, "cache": False,
                                "prefault": PREFAULT_IDLE >= 0}, lambda r: None)
     log(f"rank {rank}: warm-up done in {time.perf_counter() - t1:.1f}s")
+
+    if CONCURRENT > 1:
+        if world.size() != 2 or CONCURRENT != 2:
+            raise SystemExit("--concurrent 2 needs exactly 2 ranks")
+        engine = Engine(world, model, processor)
+        if rank != 0:
+            engine.run_follower()
+            return
+        ENGINE_QUEUE = _queue.Queue()
+        server = ThreadingHTTPServer((args.host, args.port), make_handler(world, model, processor, config, args.model))
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        log(f"serving on http://{args.host}:{args.port}/v1  ({world.size()} node(s), up to 2 requests at once)")
+        engine.run_rank0()
+        return
 
     if rank != 0:
         # Worker: wait for jobs from rank 0 and generate in lockstep, forever.
