@@ -1083,6 +1083,8 @@ def interleave(rank, lanes, first_half, second_half, exchange, on_token=None, wa
         token_seen, control_seen, hidden_seen = exchange(hidden, token, control)
         if rank == 1 and pending is not None:
             pending.tokens.append(token_seen)
+            if on_token is not None:
+                on_token(pending, token_seen)  # rank 1 mirrors the text; rank 0 decides stops
         step += 1
         if draining:
             return step
@@ -1188,26 +1190,40 @@ class Engine:
         return (None if t < 0 else t), c, g[1:2]
 
     # --- rank 0: what happens to each sampled token
-    def accept(self, slot, token):
-        """Stop checks, detokenizing and streaming for one token, as run_job does. Rank 0 only."""
+    def advance(self, slot, token):
+        """Detokenize one token and apply the stop checks run_job applies. Deterministic, so
+        every rank reaches the same decision from the same tokens; only rank 0 streams.
+        Returns the stop reason or None. (A client that went away is rank 0's to decide.)"""
         job = slot.job
-        events, cancel = self.side[slot.sid]
         if self.tok.stopping_criteria(token):
-            return self.finish(slot, "stop")
+            return "stop"
         slot.detok.add_token(token, skip_special_token_ids=[])
         seg = slot.detok.last_segment
         slot.text += seg
         slot.n += 1
-        events.put(("chunk", SimpleNamespace(text=seg, token=token)))
+        if self.rank == 0:
+            self.side[slot.sid][0].put(("chunk", SimpleNamespace(text=seg, token=token)))
         marker = job.get("stop_marker")
         if marker and marker in slot.text:
-            return self.finish(slot, "stop")
+            return "stop"
         if slot.n % LOOP_EVERY == 0 and looping(slot.text):
             job["_looped"] = True
-            return self.finish(slot, "loop")
-        if slot.n >= job["max_tokens"] or cancel.is_set():
-            return self.finish(slot, "length")
-        return False
+            return "loop"
+        if slot.n >= job["max_tokens"]:
+            return "length"
+        return None
+
+    def accept(self, slot, token):
+        """Rank 0: advance(), and finish the slot if it stops or its client went away."""
+        why = self.advance(slot, token)
+        if why is None and self.side[slot.sid][1].is_set():
+            why = "cancel"
+        return self.finish(slot, why) if why else False
+
+    def mirror(self, slot, token):
+        """Rank 1: keep the slot's text and count in step with rank 0."""
+        if self.advance(slot, token):
+            slot.finished = True
 
     def on_token(self, slot, token):
         slot.tokens.append(token)
@@ -1247,22 +1263,86 @@ class Engine:
         slot.prompt_tps = len(ids) / max(time.perf_counter() - t0, 1e-9)
         slot.t_decode = time.perf_counter()
         slot.text, slot.n = "", 0
+        slot.seed = int(job["seed"])
+        slot.detok = _make_detokenizer(self.processor)
         if self.rank == 0:
-            slot.detok = _make_detokenizer(self.processor)
             self.accept(slot, first)
+        else:
+            self.mirror(slot, first)
         return slot
+
+    SYNC_EVERY = 8  # lone request: tokens between checks for rank 0's own events
+
+    def _sample_lockstep(self, slot, token, index):
+        """Pipeline forward of `token` (both ranks, as stream_generate does), then a sample
+        drawn with a per-token seed, so both ranks get the same token. Lazy."""
+        logits = self.lm(mx.array([[token]]) if isinstance(token, int) else token.reshape(1, 1),
+                         cache=slot.cache).logits[:, -1, :]
+        mx.random.seed((slot.seed * 1_000_003 + index) % (2 ** 31))
+        return slot.sampler(logits - mx.logsumexp(logits, axis=-1, keepdims=True))
+
+    def decode_single(self, slot):
+        """One request: lockstep like normal mode, building one token ahead.
+
+        Both ranks sample the same token and make the same stop decision (advance() is
+        deterministic). Every SYNC_EVERY tokens a CPU all_sum tells rank 1 whether rank 0
+        wants to stop for its own reasons (a request is waiting, or the client went away).
+        """
+        nxt = self._sample_lockstep(slot, slot.tokens[-1], len(slot.tokens))
+        mx.async_eval(nxt)
+        since = 0
+        while True:
+            cur = nxt
+            nxt = self._sample_lockstep(slot, cur, len(slot.tokens) + 1)  # build ahead
+            mx.async_eval(nxt)
+            tok = int(cur.item())
+            slot.tokens.append(tok)
+            why = self.advance(slot, tok)
+            since += 1
+            event = False
+            if why is None and since >= self.SYNC_EVERY:
+                since = 0
+                flag = 0
+                if self.rank == 0:
+                    cancelled = self.side[slot.sid][1].is_set()
+                    waiting = len(self.slots) < CONCURRENT and not ENGINE_QUEUE.empty()
+                    flag = 2 if cancelled else (1 if waiting else 0)
+                flag = int(mx.distributed.all_sum(mx.array([flag]), group=self.world, stream=mx.cpu).item())
+                if flag == 2:
+                    why = "cancel"
+                elif flag == 1:
+                    event = True
+            if why or event:
+                # The token built ahead is already in the cache on both ranks: take it too.
+                ahead = int(nxt.item())
+                if why:
+                    if self.rank == 0:
+                        self.finish(slot, why)
+                    else:
+                        slot.finished = True
+                    return
+                slot.tokens.append(ahead)
+                why = self.advance(slot, ahead)
+                if why:
+                    if self.rank == 0:
+                        self.finish(slot, why)
+                    else:
+                        slot.finished = True
+                return
 
     def decode(self):
         live = [s for s in self.slots if not s.finished]
         if not live:
             return
+        if len(live) == 1:
+            return self.decode_single(live[0])
         lanes = [live[0], live[1] if len(live) > 1 else None]
         if self.rank == 0:
             def want_event():  # a waiting request and room for it (cancel is handled per token)
                 return len(live) < CONCURRENT and not ENGINE_QUEUE.empty()
             interleave(0, lanes, None, self.second_half, self.exchange, self.on_token, want_event)
         else:
-            interleave(1, lanes, self.first_half, None, self.exchange)
+            interleave(1, lanes, self.first_half, None, self.exchange, self.mirror)
 
     def run_rank0(self):
         while True:

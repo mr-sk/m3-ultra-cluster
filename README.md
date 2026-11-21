@@ -574,11 +574,16 @@ Rank 0 alone samples after the first token, applies the stop checks and the loop
 guard, and streams. The scheduling is tested offline by `interleave_test.py` (two
 fake ranks as threads; 40 random runs of request lengths and event timings).
 
+With only one request active, the engine decodes in lockstep like normal mode,
+building one token ahead: both ranks sample the same token (a per-token seed from the
+job's seed) and make the same stop decisions (`advance()` is deterministic, and rank 1
+keeps the text too); every 8 tokens a CPU all_sum tells rank 1 whether rank 0 wants
+to stop for its own reasons (a request waiting, or the client gone).
+
 Live, two recorded agent requests (17-20k-token prompts, greedy, 96 tokens): output
-identical to normal mode alone and with both at once. Decode: normal mode 29.1-29.4
-tok/s; two at once 24.2-24.4 tok/s each (about 48.6 combined, 1.66x); one request in
-concurrent mode 24.4 tok/s, 17% below normal mode (two exchanges per token and no
-building ahead).
+identical to normal mode, alone and with both at once. Decode: normal mode 29.1-29.4
+tok/s; one request in concurrent mode 28.6-28.9 (24.4 before the lockstep path); two
+at once 24.5-24.6 each, about 49 combined.
 
 ### profile_half.py, active_bytes.py: where a decoded token's time goes
 
