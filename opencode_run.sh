@@ -12,6 +12,8 @@
 #              (git checkout -- .); otherwise the repo must already be clean
 #   TEST_CMD   run after the session, e.g. "swift test" (default: none)
 #   MODEL      provider/model to use instead of the config's default
+#   ALLOW_PARALLEL=1  skip the "OpenCode already running" check, to run several of
+#              these at once on separate repos (each still uses its own --standalone server)
 #
 # OpenCode must not be running: quit the TUI too, since it restarts the
 # background service within seconds, and a second session editing the same
@@ -32,7 +34,7 @@ OUT=$(cd "$OUT" && pwd)
 cd "$REPO" || exit 66
 
 # Match OpenCode executables only, not command lines that mention the word.
-if ps -axo comm | grep -qi opencode; then
+if [ "${ALLOW_PARALLEL:-0}" != 1 ] && ps -axo comm | grep -qi opencode; then
     echo "ABORT: OpenCode is already running:"
     ps -axo pid,comm | grep -i opencode
     exit 2

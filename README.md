@@ -713,6 +713,9 @@ ended (`last stop` means the model finished). It refuses to start if any
 OpenCode process is running: a TUI left open restarts OpenCode's background
 service within seconds, and in one run a second session edited the same repo
 at the same time. Without `RESET=1` the repo must already be clean.
+`ALLOW_PARALLEL=1` skips that check, for several runs at once on separate copies
+of a repo (each still starts its own `--standalone` OpenCode server); `runners/pairs.sh`
+uses it.
 
 Used for the Test B repeats. Adding this general line to the task's working
 rules took the one requirement the model kept missing from 3 of 7 runs to
@@ -725,6 +728,27 @@ rules took the one requirement the model kept missing from 3 of 7 runs to
 
 With "check every clause against your diff" instead, it was 3 of 4: the model
 paraphrased the clause it had missed and then reported it as done.
+
+### runners/: restarting the server, live checks, batches of agent runs
+
+Run on the client Mac (where OpenCode runs). Machine-specific values come from
+`~/.config/m3-cluster.env`, outside the repo (format in `runners/cluster_env.sh`):
+rank 0's ssh host, rank 1's address as seen from rank 0, the server URL, the model
+path, and the server flags and proxy rules to restore after a test.
+
+- `runners/restart.sh [FLAGS...]`: restart the server on both ranks with those flags
+  (e.g. `--concurrent 2`), keeping the old log, and wait until it serves.
+- `runners/live_test.sh REQ1.json REQ2.json`: two recorded agent requests, greedy, in
+  normal mode, `--concurrent 2` one at a time, and both at once; reports whether the
+  last two match normal mode exactly (`conc_client.py` sends them).
+- `runners/pairs.sh`: batches of OpenCode runs (`opencode_run.sh`), two at a time on
+  `--concurrent 2` or one at a time with `SIDES=a`, each from a clean repo, with the
+  proxy on the test's rules. Waits for the agents only, kills a pair after `LIMIT`
+  seconds, and always restores the everyday server and proxy and resets the repos.
+  ```
+  TASK=task.txt REPO_A=~/src/app REPO_B=~/src/app-copy RULES=rules.txt OUT=runs \
+    PAIRS=3 runners/pairs.sh
+  ```
 
 ## Copying models between the nodes
 
