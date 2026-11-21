@@ -17,9 +17,11 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   ```bash
   nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
     $HOME/vlm-env/bin/python $HOME/vlm_cluster_server.py \
-    --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 > ~/dsv4-server.log 2>&1 < /dev/null &
+    --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 --concurrent 2 > ~/dsv4-server.log 2>&1 < /dev/null &
   ```
   Stop: `pkill -f vlm_cluster_server.py` (orange's half exits with it).
+  `--concurrent 2` lets two agents share the cluster (below); leave it out for the
+  original one-request-at-a-time path.
 - **Speed:** ~29 tok/s decoding, ~700 tok/s reading new prompt tokens; a prompt
   that repeats an earlier prefix is read from a cache.
 - **Coding agent:** OpenCode through `record_proxy.py --rules working_rules.txt
@@ -34,7 +36,7 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   layer when the layer count doesn't divide evenly; until 2026-11-19 layer 21 ran
   nowhere. The server now installs mlx-lm's split (perplexity 6.20 to 6.02).
 - **Two agents at once:** `--concurrent 2` interleaves two requests across the
-  pipeline (off by default): 6 agent runs in 26.4 min instead of ~41.5, a lone
+  pipeline (our everyday setting; off unless passed): 6 agent runs in 26.4 min instead of ~41.5, a lone
   request decodes at about normal speed (28.6-28.9 tok/s).
 - **Tried and not used:** speculative decoding with the model's own DSpark drafter
   (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
@@ -298,7 +300,7 @@ node over `mx.distributed`; both generate in lockstep.
 ```bash
 nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
   $HOME/vlm-env/bin/python $HOME/vlm_cluster_server.py \
-  --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 > ~/dsv4-server.log 2>&1 < /dev/null &
+  --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 --concurrent 2 > ~/dsv4-server.log 2>&1 < /dev/null &
 
 curl -s localhost:8090/health
 ```
