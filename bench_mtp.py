@@ -116,6 +116,35 @@ def mean_nll(model, processor, text, n_tokens):
         n += len(targets)
     return total / n, n
 
+def decode_nll(model, processor, text, n_tokens, n_decode, idxs, block):
+    """Mean NLL of the last n_decode tokens of `text`, read one token at a time as in
+    decoding (prefill always with HISA's default), with the indexer's decode path set by
+    `block` (64 = HISA, 0 = exact)."""
+    from mlx_vlm.models import cache as vcache
+    tok = getattr(processor, "tokenizer", processor)
+    ids = tok.encode(text)
+    ids = (ids * (n_tokens // len(ids) + 1))[:n_tokens]
+    lm = model.language_model
+    c = vcache.make_prompt_cache(lm)
+    head = len(ids) - n_decode
+    for m in idxs:
+        m.index_block = 64
+    for s in range(0, head - 1, 512):
+        lm(mx.array(ids[s:min(s + 512, head - 1)])[None], cache=c)
+        mx.eval([x.state for x in c])
+    for m in idxs:
+        m.index_block = block
+    total, agree = 0.0, 0
+    for i in range(head - 1, len(ids) - 1):
+        lg = lm(mx.array([[ids[i]]]), cache=c).logits[0, -1].astype(mx.float32)
+        total += (mx.logsumexp(lg) - lg[ids[i + 1]]).item()
+        agree += int(mx.argmax(lg).item() == ids[i + 1])
+    for m in idxs:
+        m.index_block = 64
+    n = len(ids) - head
+    return total / n, agree / n, n
+
+
 PARTS = {}
 
 
@@ -181,6 +210,8 @@ def main():
     ap.add_argument("--fix-split", action="store_true", help="mlx-lm's pipeline split (no dropped layer)")
     ap.add_argument("--nll", default="", help="score this text file: mean negative log-likelihood per token")
     ap.add_argument("--nll-tokens", type=int, default=3072)
+    ap.add_argument("--compare-hisa", action="store_true", help="also score with HISA off (exact indexer)")
+    ap.add_argument("--decode-nll", type=int, default=0, help="also score the last N tokens one at a time, HISA vs exact")
     ap.add_argument("--save-text", default="", help="rank 0 writes each run's output to PREFIX-<label>.txt")
     ap.add_argument("--only", choices=["greedy-draft", "greedy", "nll"], help="greedy-draft: drafter only; "
                     "greedy: base greedy, then the drafter at each --blocks size")
@@ -261,8 +292,23 @@ def main():
     run(model, processor, "Hi", 4, 0.0, 0)  # warm-up, as the server does
     mem("after warm-up")
     if args.nll:
-        nll, n = mean_nll(model, processor, open(args.nll).read(), args.nll_tokens)
-        say(f"NLL over {n} tokens: {nll:.4f} nats/token (perplexity {__import__('math').exp(nll):.3f})")
+        import math
+        import mlx_vlm.models.deepseek_v4.language as _dl
+        idxs = [m for _, m in inner.named_modules() if isinstance(m, _dl.Indexer)]
+        modes = [("HISA (default)", 64)] + ([("exact indexer", 0)] if args.compare_hisa else [])
+        for label, block in modes:
+            for m in idxs:
+                m.index_block = block
+            nll, n = mean_nll(model, processor, open(args.nll).read(), args.nll_tokens)
+            say(f"{label}: NLL over {n} tokens: {nll:.4f} nats/token (perplexity {math.exp(nll):.3f})")
+        for m in idxs:
+            m.index_block = 64
+        if args.decode_nll:
+            for label, block in (("HISA decode", 64), ("exact decode", 0)):
+                nll, acc, n = decode_nll(model, processor, open(args.nll).read(), args.nll_tokens,
+                                         args.decode_nll, idxs, block)
+                say(f"{label}: NLL over the last {n} of {args.nll_tokens} tokens, one at a time: "
+                    f"{nll:.4f} nats/token, top-1 agrees with the text {acc:.1%}")
     if args.diag or args.only == "nll":
         return
     if args.time_parts:

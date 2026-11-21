@@ -43,6 +43,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import queue as _queue
+import collections as _collections
 import threading
 from types import SimpleNamespace
 
@@ -840,6 +841,8 @@ def build_job(body, processor, config):
         thinking, effort, budget = reasoning_mode(body)
         job = finish_job(body, dsv4_prompt(messages, tools, thinking, effort), tools, "dsml",
                          think=thinking)
+        if not thinking:
+            job["_pc_src"] = (messages, tools)  # for queue_precache; never sent to other ranks
         if budget:
             # Leave room for the answer: a client's max_tokens can be close to the
             # budget (Cline's ~4k cut a turn off mid-reasoning, 2026-11-08), and the
@@ -1040,6 +1043,25 @@ def apply_stop(text, stops):
 
 CONCURRENT = 1        # --concurrent
 ENGINE_QUEUE = None   # rank 0: (job, events queue, cancel Event); None to shut down
+PRECACHE = _collections.deque()  # rank 0: (prompt after a tool result, prompt after a user turn)
+PRECACHE_MAX_NEW = 8192          # most tokens one precache prefills
+
+
+def queue_precache(messages, tools, reply):
+    """Rank 0 handler threads: after a reply, ask the engine to cache the conversation with
+    the reply in it, as the client will send it back.
+
+    The reply's encoding ends where the next turn begins, and that depends on what comes
+    next, so encode it followed by a tool result and by a user turn: the engine keeps
+    their common tokens. If the next request differs anyway (the client edited the
+    reply), the lookup falls back to the prompt's own snapshot, as before.
+    """
+    msgs = list(messages) + [reply]
+    call_id = (reply.get("tool_calls") or [{}])[0].get("id", "x")
+    after_tool = dsv4_prompt(msgs + [{"role": "tool", "tool_call_id": call_id, "content": "x"}], tools)
+    after_user = dsv4_prompt(msgs + [{"role": "user", "content": "y"}], tools)
+    PRECACHE.append((after_tool, after_user))
+    ENGINE_QUEUE.put(("precache",))  # wakes the engine; the work is in PRECACHE
 
 
 class Slot:
@@ -1344,6 +1366,47 @@ class Engine:
         else:
             interleave(1, lanes, self.first_half, None, self.exchange, self.mirror)
 
+    def tokenize(self, prompt):
+        return _orig_prepare(self.model, self.processor, prompt, None, None, None, {})[0].flatten().tolist()
+
+    def precache_ids(self):
+        """Rank 0: the token ids to precache, from what the handlers queued."""
+        out = []
+        while PRECACHE:
+            a, b = (self.tokenize(x) for x in PRECACHE.popleft())
+            n = 0
+            while n < min(len(a), len(b)) and a[n] == b[n]:
+                n += 1
+            out.append(a[:n])
+        return out
+
+    def precache(self, ids):
+        """Both ranks: extend the longest snapshot that is a prefix of `ids` to all of
+        them, and keep that as a snapshot. Returns the tokens prefilled."""
+        best = None
+        for snap in SNAPS:
+            n = len(snap["ids"])
+            if n < len(ids) and (best is None or n > len(best["ids"])) and ids[:n] == snap["ids"]:
+                best = snap
+        if best is None or len(ids) - len(best["ids"]) > PRECACHE_MAX_NEW:
+            return 0
+        cache = copy.deepcopy(best["cache"])
+        rest = ids[len(best["ids"]):]
+        step = PREFILL_STEP
+        for i in range(0, len(rest), step):
+            self.lm(mx.array(rest[i:i + step])[None], cache=cache, skip_logits=True)
+            mx.eval([c.state for c in cache])
+        _add_snapshot(list(ids), cache)
+        return len(rest)
+
+    def run_precache(self, lists):
+        for ids in lists:
+            t = time.perf_counter()
+            n = self.precache(ids)
+            if self.rank == 0:
+                log(f"precache: {n} tokens on top of {len(ids) - n} in {time.perf_counter() - t:.2f}s"
+                    if n else f"precache: skipped ({len(ids)} tokens, no snapshot to build on)")
+
     def run_rank0(self):
         while True:
             finished = [s.sid for s in self.slots if s.finished]
@@ -1354,7 +1417,8 @@ class Engine:
                 if item is None:
                     broadcast(self.world, {"cmd": "shutdown"})
                     return
-                admits.append(item)
+                if item[0] != "precache":
+                    admits.append(item)
             while len(self.slots) + len(admits) < CONCURRENT:
                 try:
                     item = ENGINE_QUEUE.get_nowait()
@@ -1363,15 +1427,22 @@ class Engine:
                 if item is None:
                     ENGINE_QUEUE.put(None)  # finish the current requests first
                     break
-                admits.append(item)
+                if item[0] != "precache":
+                    admits.append(item)
+            pre = self.precache_ids()
             plan = []
             for job, events, cancel in admits:
                 sid = self.next_sid
                 self.next_sid += 1
                 self.side[sid] = (events, cancel)
                 plan.append((sid, job, events))
-            broadcast(self.world, {"cmd": "change", "finished": finished,
+            broadcast(self.world, {"cmd": "change", "finished": finished, "precache": pre,
                                    "admit": [[sid, job] for sid, job, _ in plan]})
+            try:
+                self.run_precache(pre)
+            except Exception:
+                SNAPS.clear()
+                raise
             for sid, job, events in plan:
                 try:
                     slot = self.admit(sid, job, lambda total, reused, ev=events: ev.put(("start", (total, reused))))
@@ -1392,6 +1463,7 @@ class Engine:
                 return
             gone = set(cmd.get("finished", []))
             self.slots = [s for s in self.slots if s.sid not in gone]
+            self.run_precache(cmd.get("precache", []))
             for sid, job in cmd.get("admit", []):
                 self.slots.append(self.admit(sid, job))
             go = broadcast(self.world)
@@ -1453,11 +1525,13 @@ def make_handler(world, model, processor, config, model_id):
             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 
+            pc_src = job.pop("_pc_src", None)
             job["prefault"] = needs_prefault(time.monotonic(), LAST_JOB_END)
             if CONCURRENT <= 1:
                 broadcast(world, job)  # every rank now starts the same job
 
-            state = {"text": "", "sent": 0, "rsent": 0, "stopped": False, "client_gone": False}
+            state = {"text": "", "sent": 0, "rsent": 0, "stopped": False, "client_gone": False,
+                     "content": ""}  # content as streamed: what the client will send back
 
             def send_sse(obj):
                 if state["client_gone"]:
@@ -1511,6 +1585,7 @@ def make_handler(world, model, processor, config, model_id):
                     state["stopped"] = True
                 if stream and len(visible) > state["sent"]:
                     send_sse(chunk_obj({"content": visible[state["sent"]:]}))
+                    state["content"] += visible[state["sent"]:]
                 state["sent"] = len(visible)
 
             t0 = time.perf_counter()
@@ -1609,6 +1684,7 @@ def make_handler(world, model, processor, config, model_id):
                 if len(text) > state["sent"] and (job["think"] or (job["tool_open"] and not tool_calls)):
                     # thinking: the whole answer (held until now); otherwise any unparsed remainder
                     send_sse(chunk_obj({"content": text[state["sent"]:]}))
+                    state["content"] += text[state["sent"]:]
                 if tool_calls:
                     send_sse(chunk_obj({"tool_calls": [dict(c, index=i) for i, c in enumerate(tool_calls)]}))
                 final = chunk_obj({}, finish)
@@ -1632,7 +1708,55 @@ def make_handler(world, model, processor, config, model_id):
                     "usage": usage,
                 })
 
+            if (CONCURRENT > 1 and PROMPT_CACHE and pc_src is not None and pc_src[1]
+                    and job.get("cache", True) and finish in ("tool_calls", "stop")
+                    and not state["client_gone"]):
+                content = state["content"] if stream else text
+                reply = dict({"role": "assistant", "content": content},
+                             **({"tool_calls": tool_calls} if tool_calls else {}))
+                try:
+                    queue_precache(pc_src[0], pc_src[1], reply)
+                except Exception as e:  # an optimisation only: never fail the request for it
+                    log(f"{rid}: precache not queued: {e!r}")
+
     return Handler
+
+
+HISA_MIN_POOLED = 12_000  # --hisa-min-pooled; 0 keeps mlx-vlm's HISA everywhere
+
+
+def install_exact_indexer():
+    """DeepSeek-V4 decode: choose the indexer's top-k exactly while the compressed context is
+    short, and use mlx-vlm's HISA (coarse block filter, then fine top-k) only beyond that.
+
+    HISA approximates the exact selection the model was trained with and is meant for long
+    contexts; on M3 Ultra it was slower than the exact selection up to 32k tokens (0.6-0.7
+    ms per half at 15k and 32k) and equal at 60k (2026-11-20). Prefill is unchanged.
+    """
+    try:
+        from mlx_vlm.models.deepseek_v4 import language as dl
+    except ImportError:
+        return
+    orig = dl.Indexer._hisa_select
+
+    seen = set()
+
+    def select(self, q, pooled, x, k):
+        exact = pooled.shape[1] < HISA_MIN_POOLED
+        if exact not in seen:
+            seen.add(exact)
+            log(f"indexer: {'exact top-k' if exact else 'HISA'} in decode "
+                f"({pooled.shape[1]} compressed positions; switch at {HISA_MIN_POOLED})")
+        if not exact:
+            return orig(self, q, pooled, x, k)
+        scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(mx.float32)
+        scores = mx.maximum(scores, 0) * self.scale
+        weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads ** -0.5)
+        scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+        return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+
+    dl.Indexer._hisa_select = select
+    log(f"indexer: exact top-k in decode below {HISA_MIN_POOLED} compressed positions")
 
 
 def fixed_pipeline(self, group):
@@ -1688,7 +1812,7 @@ def pin_weights():
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
     global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
-    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE, CONCURRENT, ENGINE_QUEUE
+    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE, CONCURRENT, ENGINE_QUEUE, HISA_MIN_POOLED
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -1716,6 +1840,9 @@ def main():
     ap.add_argument("--no-wake", action="store_true",
                     help="wait for jobs inside the all_sum instead (spins a core per waiting rank)")
     ap.add_argument("--cache-max-snapshots", type=int, default=CACHE_MAX_SNAPS)
+    ap.add_argument("--hisa-min-pooled", type=int, default=HISA_MIN_POOLED,
+                    help="DeepSeek-V4 decode: exact top-k below this many compressed positions "
+                         "(4 tokens each), HISA from there on; 0 = HISA always")
     ap.add_argument("--cache-budget-tokens", type=int, default=CACHE_BUDGET_TOKENS)
     ap.add_argument("--cache-checkpoint-gap", type=int, default=CACHE_CKPT_GAP)
     args = ap.parse_args()
@@ -1735,6 +1862,9 @@ def main():
     world = WORLD = mx.distributed.init()
     rank = world.rank()
     t0 = time.perf_counter()
+    HISA_MIN_POOLED = args.hisa_min_pooled
+    if HISA_MIN_POOLED:
+        install_exact_indexer()
     if world.size() > 1:
         import mlx_vlm.models.pipeline as vlm_pipeline
         vlm_pipeline.PipelineMixin.pipeline = fixed_pipeline

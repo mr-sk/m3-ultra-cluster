@@ -17,6 +17,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--context", type=int, default=8192)
+    ap.add_argument("--ablate-only", action="store_true")
     ap.add_argument("prompt")
     args = ap.parse_args()
     world = mx.distributed.init(); rank = world.rank()
@@ -28,7 +29,8 @@ def main():
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
     lm = model.language_model; inner = lm.model
     tok = getattr(processor, "tokenizer", processor)
-    ids = tok.encode(open(args.prompt).read(), add_special_tokens=False)[: args.context]
+    ids = tok.encode(open(args.prompt).read(), add_special_tokens=False)
+    ids = (ids * (args.context // len(ids) + 1))[: args.context]  # tile the text for long contexts
     caches = vcache.make_prompt_cache(lm)
     prefill(lm, ids, caches)  # lockstep, both ranks: a realistic cache
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
@@ -55,6 +57,60 @@ def main():
         mx.async_eval(out)
     mx.eval(out)
     pipelined = (time.perf_counter() - t) / N
+
+    # Ablations: replace one component with a free stand-in and time the half pipelined.
+    # The output is meaningless while ablated; the time saved is what the component costs.
+    def timed_pipelined():
+        for _ in range(3):
+            mx.eval(step())
+        t = time.perf_counter(); o = None
+        for _ in range(N):
+            o = step(); mx.async_eval(o)
+        mx.eval(o)
+        return (time.perf_counter() - t) / N
+
+    base = timed_pipelined()
+    results = [("baseline", base)]
+    idxs = [m for _, m in inner.named_modules() if isinstance(m, dl.Indexer)]
+    for m in idxs:
+        m.index_block = 0
+    results.append(("exact indexer (HISA off)", timed_pipelined()))
+    for m in idxs:
+        m.index_block = 64
+    orig_idx = dl.Indexer.__call__
+    orig_comp = dl.Compressor.__call__
+    orig_sparse = dl._sparse_pooled_attention
+    fixed_topk = {}
+
+    def free_indexer(self, x, q_residual, position_rope, pool_cache, offset):
+        key = id(self)
+        if key not in fixed_topk:  # compute once, reuse: no indexer work afterwards
+            fixed_topk[key] = orig_idx(self, x, q_residual, position_rope, pool_cache, offset)
+            mx.eval(fixed_topk[key])
+        return fixed_topk[key]
+
+    dl.Indexer.__call__ = free_indexer
+    results.append(("indexer free (its compressor and top-512 selection)", timed_pipelined()))
+    dl.Indexer.__call__ = orig_idx
+    last_pooled = {}
+
+    def free_compressor(self, x, pool_cache, offset):
+        key = id(self)
+        if key not in last_pooled:
+            last_pooled[key] = orig_comp(self, x, pool_cache, offset)
+            mx.eval(last_pooled[key])
+        return last_pooled[key]
+
+    dl.Compressor.__call__ = free_compressor
+    fixed_topk.clear()
+    dl.Indexer.__call__ = free_indexer
+    results.append(("indexer and every compressor free", timed_pipelined()))
+    dl.Indexer.__call__ = orig_idx
+    dl.Compressor.__call__ = orig_comp
+    for name, t in results:
+        print(f"[rank {rank}] ablation: {name}: {t * 1e3:.1f} ms per half (saves {(base - t) * 1e3:.1f} ms)", flush=True)
+    if args.ablate_only:
+        return
 
     # per component: force an eval after attention and after the expert layer, in every layer
     parts = {"attn": 0.0, "ffn": 0.0}

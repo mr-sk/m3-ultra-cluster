@@ -38,6 +38,12 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
 - **Two agents at once:** `--concurrent 2` interleaves two requests across the
   pipeline (our everyday setting; off unless passed): 6 agent runs in 26.4 min instead of ~41.5, a lone
   request decodes at about normal speed (28.6-28.9 tok/s).
+- **Each reply is cached for the next turn** (with `--concurrent 2`): while the agent
+  runs its tools, the server reads its own reply into the prompt cache, so a typical
+  turn reads ~39 new tokens (0.23 s) instead of ~550 (1.4 s); 71 of 75 turns hit.
+- **Exact sparse-attention selection in decode** below 48k tokens of context, instead
+  of mlx-vlm's approximate HISA: same speed, better predictions on text that repeats
+  earlier context (0.54 vs 0.68 nats/token).
 - **Tried and not used:** speculative decoding with the model's own DSpark drafter
   (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
   both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
@@ -596,6 +602,22 @@ after another in normal mode, 1.57x the throughput. All 6 finished with every te
 passing and met the requirement the tests watch most closely; each agent took
 7.9-9.2 min, against about 6.9 alone.
 
+### Caching each reply for the next turn (`--concurrent 2`)
+
+Snapshots of the prompt cache are taken during prefill, before any generated token goes
+in, so each turn used to re-read the previous reply (~550 tokens, ~1.4 s). Splicing the
+generated tokens back in is fragile (the client sends the reply back re-encoded), so
+instead: after a reply, rank 0's handler encodes the conversation with the reply as the
+client will send it back (`queue_precache`; the content as streamed, the tool calls as
+sent), once followed by a tool result and once by a user turn, and the engine prefills
+their common tokens on top of the prompt's snapshot, on both ranks, at its next change
+point (usually while the agent runs its tools). A reply the client changed simply
+misses, and the lookup falls back to the prompt's snapshot. `precache_check.py` checks
+the encoding offline against recorded sessions (19 of 19 turns would hit). Live, 3 Test
+B runs: 71 of 75 requests reused a precached reply; median new tokens per request 39
+(was 551), mean prefill 1.64 s per request (2.20 s before); runs 6:47, 5:34, 6:43, all
+passing.
+
 ### profile_half.py, active_bytes.py: where a decoded token's time goes
 
 `active_bytes.py` (headers only) puts the weights read per token at 4.84 GB on rank 1
@@ -618,6 +640,27 @@ DeepSeek-V4 code already uses custom Metal kernels and `mx.compile`, and single-
 decode takes the fused paths. If attention ran at memory speed, decode would be ~50
 tok/s instead of ~29; that would take faster attention kernels, mainly for the
 sparse-indexed layers.
+
+`--ablate-only` replaces one part with a free stand-in and times the half pipelined
+(15k-token context; ms per half, rank 1 / rank 0):
+
+| | Rank 1 | Rank 0 |
+|---|---|---|
+| As is | 16.6 | 18.1 |
+| Exact indexer selection instead of HISA | 15.9 | 17.5 |
+| Indexer free (its compressor and top-512 selection) | 14.2 | 15.5 |
+| Indexer and every compressor free | 13.7 | 14.8 |
+
+The indexer costs ~2.5 ms per half, compressors ~0.5-1 ms more; the remaining ~14 ms is
+attention and the experts. mlx-vlm decodes with HISA (coarse block filter, then top-k
+among the kept blocks), an approximation meant for long contexts. The exact selection
+was faster here by 0.6-0.7 ms per half at 15k and 32k tokens and equal at 60k, but
+in real decoding the difference is within run-to-run noise (28.4-29.4 tok/s both ways,
+3 runs each). It predicts better, though: scoring the last 600 of 30k tokens one at a
+time (`bench_mtp.py --decode-nll 600`, a tiled text, so the tail repeats earlier
+context), 0.540 nats/token and 94.3% top-1 against HISA's 0.675 and 92.5%. The server
+uses the exact selection in decode below 12,000 compressed positions (48k tokens) and
+HISA beyond (`--hisa-min-pooled`, 0 = HISA always); prefill is unchanged.
 
 ### record_proxy.py
 
