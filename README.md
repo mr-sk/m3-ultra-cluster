@@ -33,6 +33,9 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
 - **All 43 layers run** (`split_test.py`): mlx-vlm 0.7.12's pipeline split drops a
   layer when the layer count doesn't divide evenly; until 2026-11-19 layer 21 ran
   nowhere. The server now installs mlx-lm's split (perplexity 6.20 to 6.02).
+- **Two agents at once:** `--concurrent 2` interleaves two requests across the
+  pipeline (off by default): 6 agent runs in 26.4 min instead of ~41.5, a lone
+  request decodes at about normal speed (28.6-28.9 tok/s).
 - **Tried and not used:** speculative decoding with the model's own DSpark drafter
   (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
   both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
@@ -584,6 +587,12 @@ Live, two recorded agent requests (17-20k-token prompts, greedy, 96 tokens): out
 identical to normal mode, alone and with both at once. Decode: normal mode 29.1-29.4
 tok/s; one request in concurrent mode 28.6-28.9 (24.4 before the lockstep path); two
 at once 24.5-24.6 each, about 49 combined.
+
+With real agents (OpenCode, Test B, two at a time on two copies of the repo, 3
+pairs): 6 runs in 26.4 min (pairs of 8:30, 8:44, 9:12) against about 41.5 min one
+after another in normal mode, 1.57x the throughput. All 6 finished with every test
+passing and met the requirement the tests watch most closely; each agent took
+7.9-9.2 min, against about 6.9 alone.
 
 ### profile_half.py, active_bytes.py: where a decoded token's time goes
 
