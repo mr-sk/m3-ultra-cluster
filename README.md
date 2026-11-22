@@ -602,6 +602,31 @@ after another in normal mode, 1.57x the throughput. All 6 finished with every te
 passing and met the requirement the tests watch most closely; each agent took
 7.9-9.2 min, against about 6.9 alone.
 
+### Two things that didn't help (2026-11-21)
+
+**Pipelining prefill across the two ranks.** The idea: while rank 0 reads chunk k, rank 1
+reads chunk k+1. Built and checked (bit-identical output to the lockstep path), but prefill
+stayed at ~700 tok/s: mlx-vlm's lockstep prefill already overlaps the ranks (rank 1 sends
+its hidden state asynchronously and nothing waits for logits), and each rank needs ~0.68 s
+of its own compute per 512-token chunk. Removed again. Chunk size (`--prefill-step`, one
+20k-token prompt): 256: 609, **512: 706**, 1024: 678, 2048: 546 tok/s; 4096 hit a GPU
+timeout. So prefill is compute-bound at the default.
+
+**Rules asking the agent to batch its reads.** A Test B run takes ~26 steps (~14 s each):
+~13 edits, ~12 reads of which ~7 re-read a file it already had, and only ~3 steps with
+more than one tool call (`runners/step_stats.py`). Two added rules, Test B x4 each:
+
+| Mean per run | Baseline | "read them all in one turn; don't re-read" | Same, with an example of two calls in one reply |
+|---|---|---|---|
+| Steps | 25.5 | 22.5 | 25.8 |
+| Steps with >1 call | 2.8 | 1.5 | 4.0 |
+| Re-reads | 7.5 | 6.5 | 9.0 |
+| Time | 6.55 min | 6.43 min | 6.60 min |
+
+All 12 runs passed their tests. The first rule's lower step count is within run-to-run
+noise (baseline runs range 20-29 steps) and it batched less, not more; the second batched a
+little more but read more. Neither is used.
+
 ### Caching each reply for the next turn (`--concurrent 2`)
 
 Snapshots of the prompt cache are taken during prefill, before any generated token goes
@@ -741,6 +766,8 @@ path, and the server flags and proxy rules to restore after a test.
 - `runners/live_test.sh REQ1.json REQ2.json`: two recorded agent requests, greedy, in
   normal mode, `--concurrent 2` one at a time, and both at once; reports whether the
   last two match normal mode exactly (`conc_client.py` sends them).
+- `runners/step_stats.py RUN.jsonl...`: where a run's steps went (tools per step,
+  re-reads of the same file, steps with more than one call).
 - `runners/pairs.sh`: batches of OpenCode runs (`opencode_run.sh`), two at a time on
   `--concurrent 2` or one at a time with `SIDES=a`, each from a clean repo, with the
   proxy on the test's rules. Waits for the agents only, kills a pair after `LIMIT`
