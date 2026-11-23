@@ -64,6 +64,8 @@ from mlx_vlm.models.base import create_attention_mask as _create_attention_mask
 from mlx_vlm.models.cache import CacheList as _CacheList
 from mlx_vlm.models.linear import linear as _linear
 from mlx_vlm.sample_utils import make_sampler as _make_sampler
+from mlx_vlm.sample_utils import apply_top_p as _apply_top_p
+from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.tokenizer_utils import make_streaming_detokenizer as _make_detokenizer
 import importlib
 # mlx_vlm rebinds the name `mlx_vlm.generate` to a function, so load by full name.
@@ -1187,6 +1189,11 @@ class Engine:
         self.slots = []
         self.next_sid = 0
         self.side = {}  # rank 0: sid -> (events queue, cancel Event)
+        try:
+            from mlx_vlm.models.deepseek_v4 import language as _dl
+            self.indexers = [m for _, m in self.lm.named_modules() if isinstance(m, _dl.Indexer)]
+        except ImportError:
+            self.indexers = []
 
     # --- per-step pieces for interleave()
     def first_half(self, slot):
@@ -1261,6 +1268,10 @@ class Engine:
             events.put(("chunk", SimpleNamespace(text=slot.detok.last_segment, token=None)))
         job = slot.job
         job["_text"], job["_reused"], job["_new_snaps"] = slot.text, slot.reused, slot.snaps
+        if slot.look is not None and slot.look.passes:
+            lk = slot.look
+            log(f"copy-spec: {lk.passes} verify passes, {lk.accepted}/{lk.drafted} draft tokens accepted, "
+                f"{slot.n} tokens")
         LAST_JOB_END = time.monotonic()
         dt = time.perf_counter() - slot.t_decode
         events.put(("done", SimpleNamespace(prompt_tokens=slot.prompt_tokens, generation_tokens=slot.n,
@@ -1286,6 +1297,8 @@ class Engine:
         slot.t_decode = time.perf_counter()
         slot.text, slot.n = "", 0
         slot.seed = int(job["seed"])
+        slot.prompt_ids = ids
+        slot.look = CopyLookup() if COPY_SPEC else None
         slot.detok = _make_detokenizer(self.processor)
         if self.rank == 0:
             self.accept(slot, first)
@@ -1352,11 +1365,99 @@ class Engine:
                         slot.finished = True
                 return
 
+    def _spec_step(self, slot):
+        """One step of copy-spec decoding, on every rank: returns the new tokens (at least one).
+        Invariant kept: the cache holds every token of the request except the last."""
+        index = len(slot.tokens)
+        ctx = slot.prompt_ids + slot.tokens
+        draft = []
+        if HISA_MIN_POOLED and len(ctx) + 2 * CopyLookup.MAX < 4 * HISA_MIN_POOLED:
+            draft = slot.look.draft(ctx)  # (beyond that, decode uses HISA: no exact match)
+        if not draft:
+            logits = self.lm(mx.array([[slot.tokens[-1]]]), cache=slot.cache).logits[:, -1, :]
+            mx.random.seed((slot.seed * 1_000_003 + index) % (2 ** 31))
+            return [int(slot.sampler(logits - mx.logsumexp(logits, axis=-1, keepdims=True)).item())]
+        inp = [slot.tokens[-1]] + draft
+        for m in self.indexers:  # exact top-k in the multi-token pass too (its HISA kernel differs)
+            m.index_block = 0
+        tx = start_speculative_cache(slot.cache, len(inp))
+        try:
+            logits = self.lm(mx.array(inp)[None], cache=slot.cache).logits[0].astype(mx.float32)
+        finally:
+            for m in self.indexers:
+                m.index_block = 64
+        job = slot.job
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        d = mx.array(draft)
+        if job["temperature"] <= 0:
+            preds = mx.argmax(lp, axis=-1).tolist()
+            a = 0
+            while a < len(draft) and preds[a] == draft[a]:
+                a += 1
+            bonus = preds[a]
+        else:
+            # Speculative sampling with one-token drafts: accept draft token j with probability
+            # p_j(d_j); at the first rejection sample from p_j without d_j. Exact for p.
+            if 0 < job["top_p"] < 1:
+                lp = _apply_top_p(lp, job["top_p"])
+            probs = mx.softmax(lp / max(job["temperature"], 0.01), axis=-1)
+            p_d = mx.take_along_axis(probs[:-1], d[:, None], axis=-1)[:, 0]
+            u = mx.random.uniform(shape=(len(draft),), key=mx.random.key((slot.seed * 1_000_003 + index) % (2 ** 31)))
+            ok = (u < p_d).tolist()
+            a = 0
+            while a < len(draft) and ok[a]:
+                a += 1
+            row = probs[a]
+            if a < len(draft):
+                row = mx.where(mx.arange(row.shape[0]) == draft[a], 0.0, row)
+            key = mx.random.key((slot.seed * 1_000_003 + index + 7919) % (2 ** 31))
+            bonus = int(mx.random.categorical(mx.log(row + 1e-30), key=key).item())
+        tx.commit(a + 1)  # keep inp[0..a]
+        slot.look.update(len(draft), a)
+        return draft[:a] + [bonus]
+
+    def decode_single_spec(self, slot):
+        """One request with copy-spec: like decode_single (same stop and event handling), but
+        each step may add several tokens, and nothing is built ahead."""
+        since = 0
+        while True:
+            new = self._spec_step(slot)
+            why = None
+            for tok in new:
+                slot.tokens.append(tok)
+                why = self.advance(slot, tok)
+                if why:
+                    break
+            since += len(new)
+            event = False
+            if why is None and since >= self.SYNC_EVERY:
+                since = 0
+                flag = 0
+                if self.rank == 0:
+                    cancelled = self.side[slot.sid][1].is_set()
+                    waiting = len(self.slots) < CONCURRENT and not ENGINE_QUEUE.empty()
+                    flag = 2 if cancelled else (1 if waiting else 0)
+                flag = int(mx.distributed.all_sum(mx.array([flag]), group=self.world, stream=mx.cpu).item())
+                if flag == 2:
+                    why = "cancel"
+                elif flag == 1:
+                    event = True
+            if why:
+                if self.rank == 0:
+                    self.finish(slot, why)
+                else:
+                    slot.finished = True
+                return
+            if event:
+                return
+
     def decode(self):
         live = [s for s in self.slots if not s.finished]
         if not live:
             return
         if len(live) == 1:
+            if live[0].look is not None:
+                return self.decode_single_spec(live[0])
             return self.decode_single(live[0])
         lanes = [live[0], live[1] if len(live) > 1 else None]
         if self.rank == 0:
@@ -1723,6 +1824,50 @@ def make_handler(world, model, processor, config, model_id):
 
 
 HISA_MIN_POOLED = 12_000  # --hisa-min-pooled; 0 keeps mlx-vlm's HISA everywhere
+COPY_SPEC = False         # --copy-spec: draft copies from the context (engine, lone request)
+
+
+class CopyLookup:
+    """Copy drafts for speculative decoding: earlier occurrences of the last KEY tokens; the
+    one whose match with the current text reaches furthest back wins (ties: most recent),
+    if that match is at least MIN_MATCH tokens, and the draft is what followed it.
+    Deterministic, so every rank drafts the same tokens."""
+    KEY, MIN_MATCH = 6, 8
+    MIN_DRAFT, START, MAX, COOLDOWN = 8, 12, 64, 4  # passes of 2-8 tokens take mlx-vlm's slow path
+
+    def __init__(self):
+        self.pos, self.done = {}, self.KEY - 1
+        self.dlen, self.cool = self.START, 0
+        self.passes = self.drafted = self.accepted = 0
+
+    def draft(self, ctx):
+        if self.cool > 0:
+            self.cool -= 1
+            return []
+        k = self.KEY
+        while self.done < len(ctx) - 2:  # index every position except the current end
+            self.done += 1
+            self.pos.setdefault(tuple(ctx[self.done - k + 1:self.done + 1]), []).append(self.done)
+        best, best_len, end = None, 0, len(ctx) - 1
+        for p in reversed(self.pos.get(tuple(ctx[-k:]), [])[-16:]):
+            n = k
+            while n < 256 and p - n >= 0 and ctx[p - n] == ctx[end - n]:
+                n += 1
+            if n > best_len:
+                best, best_len = p, n
+        if best is None or best_len < self.MIN_MATCH:
+            return []
+        d = ctx[best + 1:best + 1 + self.dlen]
+        return d if len(d) >= self.MIN_DRAFT else []
+
+    def update(self, drafted, accepted):
+        self.passes += 1; self.drafted += drafted; self.accepted += accepted
+        if accepted == drafted:
+            self.dlen = min(self.dlen * 2, self.MAX)
+        else:
+            self.dlen = self.START
+            if accepted < 3:
+                self.cool = self.COOLDOWN
 
 
 def install_exact_indexer():
@@ -1812,7 +1957,7 @@ def pin_weights():
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
     global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
-    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE, CONCURRENT, ENGINE_QUEUE, HISA_MIN_POOLED
+    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE, CONCURRENT, ENGINE_QUEUE, HISA_MIN_POOLED, COPY_SPEC
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -1840,6 +1985,9 @@ def main():
     ap.add_argument("--no-wake", action="store_true",
                     help="wait for jobs inside the all_sum instead (spins a core per waiting rank)")
     ap.add_argument("--cache-max-snapshots", type=int, default=CACHE_MAX_SNAPS)
+    ap.add_argument("--copy-spec", action="store_true",
+                    help="--concurrent: speculative decoding with drafts copied from the context "
+                         "(lone request; verified in one pass, exact for the sampler)")
     ap.add_argument("--hisa-min-pooled", type=int, default=HISA_MIN_POOLED,
                     help="DeepSeek-V4 decode: exact top-k below this many compressed positions "
                          "(4 tokens each), HISA from there on; 0 = HISA always")
@@ -1863,6 +2011,7 @@ def main():
     rank = world.rank()
     t0 = time.perf_counter()
     HISA_MIN_POOLED = args.hisa_min_pooled
+    COPY_SPEC = args.copy_spec and args.concurrent > 1
     if HISA_MIN_POOLED:
         install_exact_indexer()
     if world.size() > 1:

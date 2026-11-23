@@ -12,6 +12,7 @@
 #   PAIRS=3  PREFIX=c  SIDES="a b"  LIMIT=2400 (seconds per pair, then the runs are killed)
 #   TEST_CMD="swift test"   passed to opencode_run.sh
 #   TEST_SUMMARY=regex      the test-output line to print per run (default: XCTest's summary)
+#   SERVER_FLAGS="--concurrent 2 --copy-spec"   server flags during the runs (default --concurrent 2)
 # Ends with the everyday server ($EVERYDAY_FLAGS), the everyday proxy ($EVERYDAY_RULES)
 # and both repos reset. Settings: see cluster_env.sh.
 . "$(dirname "$0")/cluster_env.sh"
@@ -29,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT
 restart_proxy "$RULES"
-restart_server "--concurrent 2"
+restart_server "${SERVER_FLAGS:---concurrent 2}"
 
 for k in $(seq 1 "$PAIRS"); do
   echo "=== pair $k: $(date +%H:%M:%S)"

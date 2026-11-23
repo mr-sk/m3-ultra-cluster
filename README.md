@@ -44,6 +44,10 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
 - **Exact sparse-attention selection in decode** below 48k tokens of context, instead
   of mlx-vlm's approximate HISA: same speed, better predictions on text that repeats
   earlier context (0.54 vs 0.68 nats/token).
+- **Copy-based speculative decoding** (`--copy-spec`, with `--concurrent 2`, off unless
+  passed): drafts the model's next 12-64 tokens from earlier text in its context (edits
+  copy file contents) and checks them in one pass. Test B, one agent at a time: 4.97 min
+  per run instead of 6.55 (-24%), decode 39.0 tok/s instead of ~28.5, all tests passing.
 - **Tried and not used:** speculative decoding with the model's own DSpark drafter
   (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
   both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
@@ -670,6 +674,17 @@ the two choose different positions (logits differed by up to 9.5, top token at 3
 positions). With exact selection in both, logits agree to 0.4-1.5 and the top token
 everywhere. Not in the server yet; agents sample at temperature 1 / top_p 0.95, which
 needs speculative-sampling acceptance instead of greedy matching.
+
+**In the server** (`--copy-spec`, engine path, lone request; two requests at once still
+interleave without it). Drafting as above; verify passes run with exact indexer selection;
+with temperature > 0 each drafted token is accepted with the probability the model gives it
+and the first rejection is resampled from the rest (`spec_sampling_test.py` checks the emitted
+distribution against the model's, top_p included, over 6,000 seeds). Live, 4 recorded edit
+turns, 400 tokens: decode 26.3-29.4 -> 31.8-51.5 tok/s greedy, 28.1-28.7 -> 32.7-50.8 at
+temperature 1 / top_p 0.95. Test B x4 (one agent at a time, `runners/pairs.sh` with
+`SERVER_FLAGS="--concurrent 2 --copy-spec" SIDES=a`): runs 6:34, 3:55, 4:40, 4:47 (mean
+4.97 min vs 6.55), all tests passing, 23.5 steps per run (25.5), 52% of draft tokens
+accepted, token-weighted decode 39.0 tok/s.
 
 Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`,
 `MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
