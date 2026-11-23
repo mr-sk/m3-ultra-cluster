@@ -17,11 +17,12 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   ```bash
   nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
     $HOME/vlm-env/bin/python $HOME/vlm_cluster_server.py \
-    --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 --concurrent 2 > ~/dsv4-server.log 2>&1 < /dev/null &
+    --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 --concurrent 2 --copy-spec > ~/dsv4-server.log 2>&1 < /dev/null &
   ```
   Stop: `pkill -f vlm_cluster_server.py` (orange's half exits with it).
-  `--concurrent 2` lets two agents share the cluster (below); leave it out for the
-  original one-request-at-a-time path.
+  `--concurrent 2` lets two agents share the cluster and `--copy-spec` drafts copied text
+  for a lone request (both below); leave them out for the original one-request-at-a-time
+  path.
 - **Speed:** ~29 tok/s decoding, ~700 tok/s reading new prompt tokens; a prompt
   that repeats an earlier prefix is read from a cache.
 - **Coding agent:** OpenCode through `record_proxy.py --rules working_rules.txt
@@ -48,6 +49,7 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   passed): drafts the model's next 12-64 tokens from earlier text in its context (edits
   copy file contents) and checks them in one pass. Test B, one agent at a time: 4.97 min
   per run instead of 6.55 (-24%), decode 39.0 tok/s instead of ~28.5, all tests passing.
+  Our everyday setting since 2026-11-23.
 - **Tried and not used:** speculative decoding with the model's own DSpark drafter
   (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
   both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
@@ -310,7 +312,7 @@ node over `mx.distributed`; both generate in lockstep.
 ```bash
 nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \
   $HOME/vlm-env/bin/python $HOME/vlm_cluster_server.py \
-  --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 --concurrent 2 > ~/dsv4-server.log 2>&1 < /dev/null &
+  --model $HOME/models/DeepSeek-V4-Flash-0731-4bit --port 8090 --concurrent 2 --copy-spec > ~/dsv4-server.log 2>&1 < /dev/null &
 
 curl -s localhost:8090/health
 ```

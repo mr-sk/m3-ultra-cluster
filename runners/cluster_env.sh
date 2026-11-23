@@ -7,7 +7,7 @@
 #   SERVER_URL=http://10.0.0.1:8090
 #   MODEL_DIR='$HOME/models/DeepSeek-V4-Flash-0731-4bit'   # expanded on HEAD
 # Optional:
-#   EVERYDAY_FLAGS="--concurrent 2"   # server flags restored after a test
+#   EVERYDAY_FLAGS="--concurrent 2 --copy-spec"   # server flags restored after a test
 #   EVERYDAY_RULES=~/dsv4-proxy/working_rules.txt  # proxy rules restored after a test
 #   PROXY_LOG=~/dsv4-proxy/proxy.log  PROXY_PORT=8091
 #   PROXY_SCRIPT=~/dsv4-proxy/record_proxy.py      # default: the repo's copy
@@ -18,7 +18,7 @@ CONF=${CLUSTER_ENV:-$HOME/.config/m3-cluster.env}
 [ -f "$CONF" ] && . "$CONF"
 : "${HEAD:?set HEAD in $CONF}" "${PEER:?set PEER in $CONF}" "${SERVER_URL:?set SERVER_URL in $CONF}"
 MODEL_DIR=${MODEL_DIR:-'$HOME/models/DeepSeek-V4-Flash-0731-4bit'}
-EVERYDAY_FLAGS=${EVERYDAY_FLAGS:---concurrent 2}
+EVERYDAY_FLAGS=${EVERYDAY_FLAGS:---concurrent 2 --copy-spec}
 PROXY_PORT=${PROXY_PORT:-8091}
 PROXY_LOG=${PROXY_LOG:-$HOME/dsv4-proxy/proxy.log}
 PROXY_SCRIPT=${PROXY_SCRIPT:-$REPO_ROOT/record_proxy.py}
