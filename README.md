@@ -627,6 +627,32 @@ All 12 runs passed their tests. The first rule's lower step count is within run-
 noise (baseline runs range 20-29 steps) and it batched less, not more; the second batched a
 little more but read more. Neither is used.
 
+### Speculation, revisited: verify cost by draft length (2026-11-22)
+
+`verify_cost.py` times one forward pass over n tokens from a 15k-token cache (tokens
+copied from earlier in the text, logits for every position; both ranks, lockstep):
+
+| n | 1 | 2 | 4 | 8 | **9** | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|---|---|---|
+| ms | 35 | 51 | 89 | 161 | **95** | 124 | 182 | 305 | 549 |
+| ms/token | 35 | 26 | 22 | 20 | **10.6** | 7.8 | 5.7 | 4.8 | 4.3 |
+
+mlx-vlm runs 2-8-token passes through "exact" kernels that reproduce one-token results bit
+for bit (with a per-token fallback), and from 9 tokens the batched path prefill uses. That
+is why the 5-token DSpark/MTP drafts were ~5x a step. Long drafts are cheap per token.
+
+`copy_check.py` measures how much of the model's output copies text already in its prompt
+(185 recorded Test B turns, 66,780 output tokens): 63% in verbatim runs of 8+ tokens, 43%
+in runs of 16+, 25% in runs of 32+; edit calls (486 tokens/turn) are 65% copied. So drafting
+from the context (prompt lookup / suffix decoding) and verifying 16-64 tokens at a time
+could cut decode time substantially; mlx-vlm already has speculative cache transactions
+(commit only the accepted tokens) for this model's caches. Not built yet.
+
+Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`,
+`MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
+down expert kernels for one-token decode (identical tokens, 26.5 vs 26.9 tok/s). Decode
+does not slow down over a 1,200-token generation (26.2-26.9 tok/s throughout).
+
 ### Caching each reply for the next turn (`--concurrent 2`)
 
 Snapshots of the prompt cache are taken during prefill, before any generated token goes
