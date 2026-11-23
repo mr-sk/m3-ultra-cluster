@@ -688,6 +688,14 @@ temperature 1 / top_p 0.95. Test B x4 (one agent at a time, `runners/pairs.sh` w
 4.97 min vs 6.55), all tests passing, 23.5 steps per run (25.5), 52% of draft tokens
 accepted, token-weighted decode 39.0 tok/s.
 
+Follow-ups (2026-11-23, Test B x4 each, one agent at a time, all tests passing): building the
+next token ahead on non-draft steps, as `decode_single` does, gave 4.77 min per run and 39.4
+tok/s (4.97 min, 39.0 without), and is in. Exact selection now runs in decode up to 16,000
+compressed positions (64k tokens; equal speed at 60k), so copy-spec stays on up to there.
+Five routed experts per token instead of six (`--experts-per-token 5`, lossy, off by default):
+4.95 min, 40.0 tok/s: only 1.5% faster decode, because the experts are not where the time
+goes; not used.
+
 Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`,
 `MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
 down expert kernels for one-token decode (identical tokens, 26.5 vs 26.9 tok/s). Decode

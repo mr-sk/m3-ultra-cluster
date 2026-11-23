@@ -1365,18 +1365,27 @@ class Engine:
                         slot.finished = True
                 return
 
+    def _draft(self, slot):
+        """A copy draft for what follows the request's tokens so far, or []."""
+        ctx = slot.prompt_ids + slot.tokens
+        if HISA_MIN_POOLED and len(ctx) + 2 * CopyLookup.MAX < 4 * HISA_MIN_POOLED:
+            return slot.look.draft(ctx)  # (beyond that, decode uses HISA: no exact match)
+        return []
+
     def _spec_step(self, slot):
         """One step of copy-spec decoding, on every rank: returns the new tokens (at least one).
         Invariant kept: the cache holds every token of the request except the last."""
-        index = len(slot.tokens)
-        ctx = slot.prompt_ids + slot.tokens
-        draft = []
-        if HISA_MIN_POOLED and len(ctx) + 2 * CopyLookup.MAX < 4 * HISA_MIN_POOLED:
-            draft = slot.look.draft(ctx)  # (beyond that, decode uses HISA: no exact match)
+        draft = Engine._draft(self, slot)
         if not draft:
+            index = len(slot.tokens)
             logits = self.lm(mx.array([[slot.tokens[-1]]]), cache=slot.cache).logits[:, -1, :]
             mx.random.seed((slot.seed * 1_000_003 + index) % (2 ** 31))
             return [int(slot.sampler(logits - mx.logsumexp(logits, axis=-1, keepdims=True)).item())]
+        return Engine._verify(self, slot, draft)
+
+    def _verify(self, slot, draft):
+        """Check a draft in one pass and keep the accepted part: returns the new tokens."""
+        index = len(slot.tokens)
         inp = [slot.tokens[-1]] + draft
         for m in self.indexers:  # exact top-k in the multi-token pass too (its HISA kernel differs)
             m.index_block = 0
@@ -1417,18 +1426,40 @@ class Engine:
         return draft[:a] + [bonus]
 
     def decode_single_spec(self, slot):
-        """One request with copy-spec: like decode_single (same stop and event handling), but
-        each step may add several tokens, and nothing is built ahead."""
+        """One request with copy-spec: like decode_single (same stop and event handling).
+
+        Without a draft it decodes one token at a time, building the next one ahead as
+        decode_single does. When a draft turns up, the token already being built is taken
+        (it is a real token) and the draft after it is verified in one pass."""
         since = 0
-        while True:
-            new = self._spec_step(slot)
-            why = None
+        nxt = None  # token being built ahead: the cache will hold every token but it
+
+        def emit(new):
+            nonlocal since
             for tok in new:
                 slot.tokens.append(tok)
-                why = self.advance(slot, tok)
-                if why:
-                    break
-            since += len(new)
+                since += 1
+                why_ = self.advance(slot, tok)
+                if why_:
+                    return why_
+            return None
+
+        while True:
+            if nxt is None:  # the cache holds every token but the last
+                draft = self._draft(slot)
+                if not draft:
+                    nxt = self._sample_lockstep(slot, slot.tokens[-1], len(slot.tokens))
+                    mx.async_eval(nxt)
+                    continue
+                why = emit(self._verify(slot, draft))
+            else:
+                cur = nxt
+                nxt = self._sample_lockstep(slot, cur, len(slot.tokens) + 1)  # build ahead
+                mx.async_eval(nxt)
+                why = emit([int(cur.item())])
+                if why is None and self._draft(slot):
+                    ahead, nxt = int(nxt.item()), None
+                    why = emit([ahead])
             event = False
             if why is None and since >= self.SYNC_EVERY:
                 since = 0
@@ -1442,6 +1473,10 @@ class Engine:
                     why = "cancel"
                 elif flag == 1:
                     event = True
+            if event and why is None and nxt is not None:
+                # The token built ahead is already in the cache on both ranks: take it too.
+                why = emit([int(nxt.item())])
+                nxt = None
             if why:
                 if self.rank == 0:
                     self.finish(slot, why)
@@ -1823,8 +1858,25 @@ def make_handler(world, model, processor, config, model_id):
     return Handler
 
 
-HISA_MIN_POOLED = 12_000  # --hisa-min-pooled; 0 keeps mlx-vlm's HISA everywhere
+HISA_MIN_POOLED = 16_000  # --hisa-min-pooled; 0 keeps mlx-vlm's HISA everywhere
 COPY_SPEC = False         # --copy-spec: draft copies from the context (engine, lone request)
+EXPERTS_PER_TOKEN = 0     # --experts-per-token: routed experts per token in learned-routing layers (0 = model's)
+
+
+def set_experts_per_token(model, k):
+    """Route each token to k experts instead of the model's top-k, in the layers with a learned
+    router (DeepSeek-V4's first hash-routed layers keep their fixed table). Fewer experts read
+    fewer weights per token; it changes the model's output. Returns the layers changed."""
+    try:
+        from mlx_vlm.models.deepseek_v4.language import MoEGate
+    except ImportError:
+        return 0
+    n = 0
+    for _, m in model.named_modules():
+        if isinstance(m, MoEGate) and not m.hash:
+            m.top_k = k
+            n += 1
+    return n
 
 
 class CopyLookup:
@@ -1876,7 +1928,8 @@ def install_exact_indexer():
 
     HISA approximates the exact selection the model was trained with and is meant for long
     contexts; on M3 Ultra it was slower than the exact selection up to 32k tokens (0.6-0.7
-    ms per half at 15k and 32k) and equal at 60k (2026-11-20). Prefill is unchanged.
+    ms per half at 15k and 32k) and equal at 60k (2026-11-20), hence the switch at 16,000
+    compressed positions (64k tokens). Prefill is unchanged.
     """
     try:
         from mlx_vlm.models.deepseek_v4 import language as dl
@@ -1957,7 +2010,7 @@ def pin_weights():
 def main():
     global PREFILL_STEP, PROMPT_CACHE, CACHE_MAX_SNAPS, CACHE_BUDGET_TOKENS, CACHE_CKPT_GAP
     global DEFAULT_REASONING_EFFORT, STATS_IN_REASONING, TRACE_DIR, RESAMPLE_ON_REPEAT
-    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE, CONCURRENT, ENGINE_QUEUE, HISA_MIN_POOLED, COPY_SPEC
+    global PREFAULT_IDLE, WORLD, PIN_WEIGHTS, WAKE, CONCURRENT, ENGINE_QUEUE, HISA_MIN_POOLED, COPY_SPEC, EXPERTS_PER_TOKEN
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--host", default="0.0.0.0")
@@ -1985,6 +2038,9 @@ def main():
     ap.add_argument("--no-wake", action="store_true",
                     help="wait for jobs inside the all_sum instead (spins a core per waiting rank)")
     ap.add_argument("--cache-max-snapshots", type=int, default=CACHE_MAX_SNAPS)
+    ap.add_argument("--experts-per-token", type=int, default=0,
+                    help="DeepSeek-V4: routed experts per token in learned-routing layers "
+                         "(0 = the model's 6); lossy, for experiments")
     ap.add_argument("--copy-spec", action="store_true",
                     help="--concurrent: speculative decoding with drafts copied from the context "
                          "(lone request; verified in one pass, exact for the sampler)")
@@ -2012,6 +2068,7 @@ def main():
     t0 = time.perf_counter()
     HISA_MIN_POOLED = args.hisa_min_pooled
     COPY_SPEC = args.copy_spec and args.concurrent > 1
+    EXPERTS_PER_TOKEN = args.experts_per_token
     if HISA_MIN_POOLED:
         install_exact_indexer()
     if world.size() > 1:
@@ -2025,6 +2082,9 @@ def main():
     else:
         model, processor = load(args.model)
     config = model.config.to_dict() if hasattr(model.config, "to_dict") else model.config
+    if EXPERTS_PER_TOKEN:
+        n = set_experts_per_token(model, EXPERTS_PER_TOKEN)
+        log(f"rank {rank}: {EXPERTS_PER_TOKEN} routed experts per token in {n} layers (lossy)")
     if is_dsv4(config):
         # Checkpoints go just before each user turn (tool results are user turns too).
         tok = getattr(processor, "tokenizer", processor)
