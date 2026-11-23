@@ -648,6 +648,29 @@ from the context (prompt lookup / suffix decoding) and verifying 16-64 tokens at
 could cut decode time substantially; mlx-vlm already has speculative cache transactions
 (commit only the accepted tokens) for this model's caches. Not built yet.
 
+**Prototype: copy-based speculative decoding** (`copy_spec.py`, prompts from
+`spec_prompts.py`: 8 random recorded Test B turns, 8.5-22k tokens, up to 400 new tokens,
+greedy, both ranks in lockstep). A draft is what followed the earlier occurrence of the last
+6 tokens whose match with the current text reaches furthest back (at least 8 tokens);
+drafts start at 12 tokens, double while fully accepted (up to 64), and after a draft with
+fewer than 3 tokens accepted the next 4 tokens are decoded normally. Drafts are verified in
+one pass inside mlx-vlm's speculative cache transaction (commit keeps only accepted tokens).
+
+| Drafter (key, min match, first, max, back-off) | Speedup over one token per pass | Runs identical to it |
+|---|---|---|
+| 4, 4, 64, 64, 0 (first try) | 0.92x (14% of draft tokens accepted) | 5/8 |
+| 8, 12, 16, 64, 6 | 1.25x | 7/8 |
+| **6, 8, 12, 64, 4** | **1.36x** (edit turns 1.17-1.79x, no turn below 1.03x) | 5/8 |
+
+Divergences are near-ties resolving differently in the multi-token pass (e.g. "step 1 and 2
+in NoteStore.swift" vs "step 1: change NoteStore ..."; a test helper named `seedLegacy` vs
+`legacyBackend`), not corruption. One prerequisite found on the way: mlx-vlm decodes with
+HISA's one-token selection but multi-token passes use a different batched HISA kernel, and
+the two choose different positions (logits differed by up to 9.5, top token at 3 of 17
+positions). With exact selection in both, logits agree to 0.4-1.5 and the top token
+everywhere. Not in the server yet; agents sample at temperature 1 / top_p 0.95, which
+needs speculative-sampling acceptance instead of greedy matching.
+
 Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`,
 `MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
 down expert kernels for one-token decode (identical tokens, 26.5 vs 26.9 tok/s). Decode
