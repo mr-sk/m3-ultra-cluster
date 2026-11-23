@@ -434,8 +434,8 @@ Limits:
   shut down. `--no-wake` turns it off. Log: `wake socket up on port 8095`.
 - Default `max_tokens` is 8192. Cline sends none, and the old 2048 default cut
   an answer off at exactly 2048 tokens.
-- Server log: `~/dsv4-server.log` on purple. (`~/vlm-server.log` there is a stale
-  symlink into an old scratchpad; don't write to it.)
+- Server log: `~/dsv4-server.log` on purple. Restarts by the runners keep the previous
+  log as `~/dsv4-logs/server/dsv4-server.<date-time>.log`.
 - **Prompt cache, one slot** (added 2026-11-08). DeepSeek-V4's cache (sliding
   window + compressed pooling layers) can't be trimmed, so mlx-vlm's built-in
   turn reuse never fires. The server deep-copies the cache at the end of each
@@ -828,7 +828,7 @@ rank 0's ssh host, rank 1's address as seen from rank 0, the server URL, the mod
 path, and the server flags and proxy rules to restore after a test.
 
 - `runners/restart.sh [FLAGS...]`: restart the server on both ranks with those flags
-  (e.g. `--concurrent 2`), keeping the old log, and wait until it serves.
+  (e.g. `--concurrent 2`), keeping the old log in `~/dsv4-logs/server/`, and wait until it serves.
 - `runners/live_test.sh REQ1.json REQ2.json`: two recorded agent requests, greedy, in
   normal mode, `--concurrent 2` one at a time, and both at once; reports whether the
   last two match normal mode exactly (`conc_client.py` sends them).

@@ -27,7 +27,7 @@ PROXY_SCRIPT=${PROXY_SCRIPT:-$REPO_ROOT/record_proxy.py}
 # FLAGS, and wait until it serves. The 15 s pause avoids JACCL's "queue pair RTR errno 14"
 # when the ranks start again too soon after stopping.
 restart_server() {
-  ssh "$HEAD" "pkill -f vlm_cluster_server.py; for i in \$(seq 1 30); do pgrep -f vlm_cluster_server.py >/dev/null || break; sleep 1; done; ssh $PEER 'for i in \$(seq 1 30); do pgrep -f vlm_cluster_server.py >/dev/null || break; sleep 1; done'; cp ~/dsv4-server.log ~/dsv4-server.\$(date +%Y%m%d-%H%M%S).log 2>/dev/null; sleep 15; nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \$HOME/vlm-env/bin/python \$HOME/vlm_cluster_server.py --model $MODEL_DIR --port 8090 $1 > ~/dsv4-server.log 2>&1 < /dev/null &"
+  ssh "$HEAD" "pkill -f vlm_cluster_server.py; for i in \$(seq 1 30); do pgrep -f vlm_cluster_server.py >/dev/null || break; sleep 1; done; ssh $PEER 'for i in \$(seq 1 30); do pgrep -f vlm_cluster_server.py >/dev/null || break; sleep 1; done'; mkdir -p ~/dsv4-logs/server; cp ~/dsv4-server.log ~/dsv4-logs/server/dsv4-server.\$(date +%Y%m%d-%H%M%S).log 2>/dev/null; sleep 15; nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/m3-ultra-jaccl.json -- \$HOME/vlm-env/bin/python \$HOME/vlm_cluster_server.py --model $MODEL_DIR --port 8090 $1 > ~/dsv4-server.log 2>&1 < /dev/null &"
   for i in $(seq 1 90); do ssh "$HEAD" 'grep -qE "serving on|Traceback" ~/dsv4-server.log' && break; sleep 10; done
   ssh "$HEAD" 'grep -E "serving on|Traceback" ~/dsv4-server.log | tail -1'
 }
