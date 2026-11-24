@@ -706,6 +706,15 @@ tools (the first user-turn token), pinned outside LRU eviction (up to 4 pinned;
 runs 3:48-4:54, mean 4.48 min (4.77 before), all tests passing; 40 snapshots used 3.0 GiB,
 purple's peak 78.5 of 84 GiB.
 
+**Drafter tuning** (`copy_spec.py --configs`, 24 recorded turns, greedy): from (key 6, min
+match 8, back-off 4, reset after a partial accept) at 1.52x, looser matching and keeping the
+draft length after a partial accept reached 1.76x with (4, 4, back-off 2); 1.74-1.77x for
+its neighbours, so it has levelled off. In the server since 2026-11-23. Live, Test B x4:
+3:14-4:55, mean 4.03 min (4.48 with the previous drafter), all tests passing, but decode only
+41.2 tok/s against 40.8 and 45% of draft tokens accepted: agents sample at temperature 1,
+where looser matches are rejected more often, so most of the replay gain doesn't carry over.
+Tuning under sampling is the next step.
+
 Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`,
 `MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
 down expert kernels for one-token decode (identical tokens, 26.5 vs 26.9 tok/s). Decode

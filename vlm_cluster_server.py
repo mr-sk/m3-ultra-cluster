@@ -1918,8 +1918,10 @@ class CopyLookup:
     one whose match with the current text reaches furthest back wins (ties: most recent),
     if that match is at least MIN_MATCH tokens, and the draft is what followed it.
     Deterministic, so every rank drafts the same tokens."""
-    KEY, MIN_MATCH = 6, 8
-    MIN_DRAFT, START, MAX, COOLDOWN = 8, 12, 64, 4  # passes of 2-8 tokens take mlx-vlm's slow path
+    # Tuned on 24 recorded agent turns (copy_spec.py, 2026-11-23): 1.76x over one token per
+    # pass, against 1.52x for (6, 8, cooldown 4, reset after a partial accept).
+    KEY, MIN_MATCH = 4, 4
+    MIN_DRAFT, START, MAX, COOLDOWN = 8, 12, 64, 2  # passes of 2-8 tokens take mlx-vlm's slow path
 
     def __init__(self):
         self.pos, self.done = {}, self.KEY - 1
@@ -1951,7 +1953,7 @@ class CopyLookup:
         if accepted == drafted:
             self.dlen = min(self.dlen * 2, self.MAX)
         else:
-            self.dlen = self.START
+            self.dlen = max(self.START, accepted)  # keep about what was accepted
             if accepted < 3:
                 self.cool = self.COOLDOWN
 

@@ -44,8 +44,9 @@ class Lookup:
     current text reaches furthest back (ties: most recent) and returns what followed it,
     if that backward match is at least `min_match` tokens."""
 
-    def __init__(self, key, min_match):
+    def __init__(self, key, min_match, by_match=0):
         self.key, self.min_match, self.pos, self.done = key, min_match, {}, key - 1
+        self.by_match = by_match  # >0: draft at least the backward match length, up to this
 
     def draft(self, ctx, limit):
         k = self.key
@@ -62,6 +63,8 @@ class Lookup:
                 best, best_len = p, L
         if best is None or best_len < self.min_match:
             return []
+        if self.by_match:
+            limit = max(limit, min(self.by_match, best_len))
         return ctx[best + 1:best + 1 + limit]
 
 
@@ -143,11 +146,12 @@ def main():
         del c
 
         for cfg in CONFIGS:
-          key, min_match, start_draft, max_draft, cooldown = cfg
+          key, min_match, start_draft, max_draft, cooldown = cfg[:5]
+          mode = cfg[5] if len(cfg) > 5 else 0  # 1: first draft as long as the match; 2: keep length on partial
           # Copy drafts, verified in one pass.
           c = copy.deepcopy(base); mx.eval([x.state for x in c])
           toks = [first]; ctx = list(ids) + toks
-          look = Lookup(key, min_match)
+          look = Lookup(key, min_match, max_draft if mode & 1 else 0)
           passes = singles = drafted = accepted = 0
           dlen, cool = start_draft, 0
           barrier(); t = time.perf_counter()
@@ -171,7 +175,7 @@ def main():
                   if a == len(draft):
                       dlen = min(dlen * 2, max_draft)
                   else:
-                      dlen = start_draft
+                      dlen = max(start_draft, a) if mode & 2 else start_draft
                       if a < 3:
                           cool = cooldown
               else:
@@ -198,7 +202,7 @@ def main():
               f"({accepted}/{drafted} draft tokens accepted), {singles} single steps; "
               f"identical to reference for {same}/{n} tokens")
     for cfg, T in totals.items():
-        say(f"TOTAL cfg (key,min_match,start,max,cooldown)={cfg}: {T['tokens']} tokens; plain {T['tokens'] / T['plain_s']:.1f} tok/s, "
+        say(f"TOTAL cfg (key,min_match,start,max,cooldown[,mode])={cfg}: {T['tokens']} tokens; plain {T['tokens'] / T['plain_s']:.1f} tok/s, "
             f"copy-spec {T['tokens'] / T['spec_s']:.1f} tok/s ({T['plain_s'] / T['spec_s']:.2f}x); "
             f"{T['same']} of the runs fully identical")
 
