@@ -696,6 +696,16 @@ Five routed experts per token instead of six (`--experts-per-token 5`, lossy, of
 4.95 min, 40.0 tok/s: only 1.5% faster decode, because the experts are not where the time
 goes; not used.
 
+**Session-start snapshots** (engine path). Every OpenCode session's first request read its
+~8.5k-token opening (system prompt, tool list, task) from scratch, 15-17 s, even when the
+previous session had sent the same bytes: with the reply precache adding a snapshot per turn,
+16 LRU slots didn't last one session. Now the cache keeps up to 40 snapshots (1.2M tokens,
+~3.8 KB/token: ~4.4 GiB when full) and always snapshots the end of the shared system prompt +
+tools (the first user-turn token), pinned outside LRU eviction (up to 4 pinned;
+`pin_snap_test.py`). Test B x4: later sessions' first request 3.1-5.3 s instead of ~15 s;
+runs 3:48-4:54, mean 4.48 min (4.77 before), all tests passing; 40 snapshots used 3.0 GiB,
+purple's peak 78.5 of 84 GiB.
+
 Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`,
 `MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
 down expert kernels for one-token decode (identical tokens, 26.5 vs 26.9 tok/s). Decode

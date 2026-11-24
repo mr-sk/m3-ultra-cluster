@@ -162,8 +162,10 @@ SNAPS = []        # [{"ids", "cache", "used", "nbytes"}], all deep copies
 _tick = [0]       # LRU clock
 _req = {}         # per-request bookkeeping for the hooks below
 BOUNDARY_IDS = set()   # token ids that start a turn; checkpoints go just before them
-CACHE_MAX_SNAPS = 16
-CACHE_BUDGET_TOKENS = 600_000
+CACHE_MAX_SNAPS = 40
+CACHE_BUDGET_TOKENS = 1_200_000  # ~3.8 KB per token on DeepSeek-V4: ~4.4 GiB when full
+CACHE_MAX_PINNED = 4   # session-start snapshots kept outside LRU eviction
+SESSION_START_MIN = 1024  # shortest shared prefix worth a session-start snapshot
 CACHE_CKPT_GAP = 4096  # minimum tokens between checkpoints inside one prompt
 CACHE_CKPT_MAX = 4     # most checkpoints per prompt, besides the final one
 _orig_prepare = _dispatch._prepare_generation_inputs
@@ -176,7 +178,8 @@ def _nbytes(cache):
 
 
 def cache_stats():
-    return {"snapshots": len(SNAPS), "tokens": sum(len(x["ids"]) for x in SNAPS),
+    return {"snapshots": len(SNAPS), "pinned": sum(1 for x in SNAPS if x.get("pinned")),
+            "tokens": sum(len(x["ids"]) for x in SNAPS),
             "gib": round(sum(x["nbytes"] for x in SNAPS) / 2**30, 3),
             "longest": max((len(x["ids"]) for x in SNAPS), default=0),
             "active_gib": round(mx.get_active_memory() / 2**30, 2),
@@ -211,16 +214,47 @@ def _prepare_hook(*a, **kw):
     return out
 
 
-def _add_snapshot(ids, cache):
+def _add_snapshot(ids, cache, pinned=False):
+    """Keep a copy of `cache` for the prefix `ids`. Pinned snapshots (session starts: the
+    system prompt and tool list every session of a client shares) are exempt from LRU
+    eviction, up to CACHE_MAX_PINNED; past that the least recently used pinned one goes."""
     snap = copy.deepcopy(cache)
     mx.eval([c.state for c in snap])
     _tick[0] += 1
     SNAPS[:] = [x for x in SNAPS if x["ids"] != ids]
-    SNAPS.append({"ids": ids, "cache": snap, "used": _tick[0], "nbytes": _nbytes(snap)})
+    SNAPS.append({"ids": ids, "cache": snap, "used": _tick[0], "nbytes": _nbytes(snap),
+                  "pinned": bool(pinned)})
     newest = SNAPS[-1]
+    pins = [x for x in SNAPS if x["pinned"]]
+    while len(pins) > CACHE_MAX_PINNED:
+        old = min((x for x in pins if x is not newest), key=lambda x: x["used"])
+        old["pinned"] = False
+        pins.remove(old)
     while len(SNAPS) > 1 and (len(SNAPS) > CACHE_MAX_SNAPS or
                               sum(len(x["ids"]) for x in SNAPS) > CACHE_BUDGET_TOKENS):
-        SNAPS.remove(min((x for x in SNAPS if x is not newest), key=lambda x: x["used"]))
+        evictable = [x for x in SNAPS if x is not newest and not x["pinned"]]
+        if not evictable:
+            break
+        SNAPS.remove(min(evictable, key=lambda x: x["used"]))
+
+
+def _session_start(ids):
+    """Where a conversation's shared prefix ends: the first user-turn token, if the prefix
+    before it (system prompt and tools) is long enough to be worth keeping."""
+    for i, t in enumerate(ids):
+        if t in BOUNDARY_IDS:
+            return i if i >= SESSION_START_MIN else None
+    return None
+
+
+def _checkpoints_with_start(ids, reused, n_input):
+    """_checkpoint_lengths, plus the session start when this prefill begins before it.
+    Returns (points relative to the tokens being prefilled, absolute session start or None)."""
+    pts = _checkpoint_lengths(ids, reused, n_input)
+    start = _session_start(ids)
+    if start is None or start <= reused or start - reused >= n_input - 1:
+        return pts, None
+    return sorted(set(pts) | {start - reused}), start
 
 
 def _snapshot(prefix_len, prompt_cache):
@@ -1157,7 +1191,7 @@ def _prefill(model, processor, job, on_start=None):
     if on_start is not None:
         on_start(len(ids), reused)
     rest = ids[reused:]
-    points = _checkpoint_lengths(ids, reused, len(rest)) if use_cache else []
+    points, pin_at = _checkpoints_with_start(ids, reused, len(rest)) if use_cache else ([], None)
     step = job.get("prefill_step", PREFILL_STEP)
     done, target, snaps = 0, len(rest) - 1, 0
     while done < target:
@@ -1168,7 +1202,7 @@ def _prefill(model, processor, job, on_start=None):
         mx.eval([c.state for c in cache])
         done = end
         if points and done == points[0]:
-            _add_snapshot(ids[: reused + done], cache)
+            _add_snapshot(ids[: reused + done], cache, pinned=(reused + done == pin_at))
             snaps += 1
             points.pop(0)
     logits = lm(mx.array(rest[-1:])[None], cache=cache).logits[:, -1, :]
