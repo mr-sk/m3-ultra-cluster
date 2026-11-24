@@ -715,6 +715,14 @@ its neighbours, so it has levelled off. In the server since 2026-11-23. Live, Te
 where looser matches are rejected more often, so most of the replay gain doesn't carry over.
 Tuning under sampling is the next step.
 
+Under sampling (`copy_spec.py --temp 1 --top-p 0.95`, the server's acceptance rule, same seeds
+for every setting, 24 turns) that guess was wrong: the deployed (4, 4, back-off 2) is still
+best at 1.64-1.65x, against 1.52x for the original setting and 1.35-1.58x for stricter
+matching; its neighbours (3-token matching 1.68x, first draft 8 or 16, no back-off, max 96)
+are within 2% or worse. So the drafter is tuned; the smaller live gain more likely comes from
+the live server building ahead on non-draft steps (which the replay does not), the mix of
+short tool-call requests, and batch-to-batch noise.
+
 Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`,
 `MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
 down expert kernels for one-token decode (identical tokens, 26.5 vs 26.9 tok/s). Decode

@@ -20,6 +20,7 @@ from mlx_vlm.models import cache as vcache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.utils import sharded_load
 from proto_interleave import fixed_pipeline
+from mlx_vlm.sample_utils import apply_top_p
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", required=True)
@@ -32,11 +33,54 @@ ap.add_argument("--start-draft", type=int, default=16, help="first draft length;
 ap.add_argument("--max-draft", type=int, default=64)
 ap.add_argument("--cooldown", type=int, default=6, help="single steps after a draft that got <3 tokens accepted")
 ap.add_argument("--show-diff", action="store_true", help="print both texts where a run diverges")
+ap.add_argument("--temp", type=float, default=0.0, help="sample at this temperature (0 = greedy), as the server does")
+ap.add_argument("--top-p", type=float, default=1.0)
+ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--configs", default="", help="'key,min_match,start,max,cooldown/...' to sweep (overrides the single settings)")
 ap.add_argument("--only", type=int, default=-1, help="run one prompt index")
 ap.add_argument("--debug", action="store_true", help="compare a verify pass with one-token decoding, then stop")
 ap.add_argument("--exact-indexer", action="store_true", help="exact top-k in every indexer (decode and multi-token), not HISA")
 args = ap.parse_args()
+
+
+def dist(logits):
+    """Sampling distribution for rows of logits: log-softmax, top_p, temperature (as the server)."""
+    lp = logits.astype(mx.float32)
+    lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+    if 0 < args.top_p < 1:
+        lp = apply_top_p(lp, args.top_p)
+    return mx.softmax(lp / max(args.temp, 0.01), axis=-1)
+
+
+def key(index, salt=0):
+    return mx.random.key((args.seed * 1_000_003 + index + salt) % (2 ** 31))
+
+
+def pick(row, index):
+    """The token at position `index` from one row of logits: greedy, or sampled with a per-token seed."""
+    if args.temp <= 0:
+        return int(mx.argmax(row).item())
+    return int(mx.random.categorical(mx.log(dist(row) + 1e-30), key=key(index)).item())
+
+
+def verify(logits, draft, index):
+    """Accepted draft length and the next token, as the server's Engine._verify decides."""
+    if args.temp <= 0:
+        preds = mx.argmax(logits, axis=-1).tolist()
+        a = 0
+        while a < len(draft) and preds[a] == draft[a]:
+            a += 1
+        return a, preds[a]
+    probs = dist(logits)
+    p_d = mx.take_along_axis(probs[:-1], mx.array(draft)[:, None], axis=-1)[:, 0]
+    ok = (mx.random.uniform(shape=(len(draft),), key=key(index)) < p_d).tolist()
+    a = 0
+    while a < len(draft) and ok[a]:
+        a += 1
+    row = probs[a]
+    if a < len(draft):
+        row = mx.where(mx.arange(row.shape[0]) == draft[a], 0.0, row)
+    return a, int(mx.random.categorical(mx.log(row + 1e-30), key=key(index, 7919)).item())
 
 
 class Lookup:
@@ -140,7 +184,7 @@ def main():
         barrier(); t = time.perf_counter()
         while len(toks) < args.max_new and toks[-1] != eos:
             y = lm(mx.array([[toks[-1]]]), cache=c).logits[0, -1]
-            toks.append(int(mx.argmax(y).item()))
+            toks.append(pick(y, len(toks)))
         barrier(); plain_s = time.perf_counter() - t
         ref = toks
         del c
@@ -165,12 +209,9 @@ def main():
               if len(draft) >= args.min_draft:
                   inp = [toks[-1]] + draft
                   tx = start_speculative_cache(c, len(inp))
-                  preds = mx.argmax(lm(mx.array(inp)[None], cache=c).logits[0], axis=-1).tolist()
-                  a = 0
-                  while a < len(draft) and preds[a] == draft[a]:
-                      a += 1
+                  a, bonus = verify(lm(mx.array(inp)[None], cache=c).logits[0], draft, len(toks))
                   tx.commit(a + 1)  # keep inp[0..a] in the cache
-                  new = draft[:a] + [preds[a]]
+                  new = draft[:a] + [bonus]
                   passes += 1; drafted += len(draft); accepted += a
                   if a == len(draft):
                       dlen = min(dlen * 2, max_draft)
@@ -180,13 +221,14 @@ def main():
                           cool = cooldown
               else:
                   y = lm(mx.array([[toks[-1]]]), cache=c).logits[0, -1]
-                  new = [int(mx.argmax(y).item())]
+                  new = [pick(y, len(toks))]
                   singles += 1
               if eos in new:
                   new = new[:new.index(eos) + 1]
               toks += new; ctx += new
           barrier(); spec_s = time.perf_counter() - t
           del c
+          n_spec = len(toks)
           toks = toks[:len(ref)]
           same = next((k for k, (x, y) in enumerate(zip(ref, toks)) if x != y), min(len(ref), len(toks)))
           n = len(ref)
@@ -196,14 +238,16 @@ def main():
               say(f"  diverges at {same}: copy-spec ...{tk.decode(toks[max(0, same - 12):same + 25])!r}")
           T = totals[cfg]
           T["plain_s"] += plain_s; T["spec_s"] += spec_s; T["tokens"] += n
+          T["spec_tokens"] = T.get("spec_tokens", 0) + n_spec
           T["same"] += int(same == n and len(toks) == n)
           say(f"cfg {cfg} prompt {i} ({pr['kind']}, {len(ids)} tokens): {n} tokens; plain {n / plain_s:.1f} tok/s, "
-              f"copy-spec {len(toks) / spec_s:.1f} tok/s ({plain_s / spec_s:.2f}x); {passes} verify passes "
+              f"copy-spec {n_spec / spec_s:.1f} tok/s ({(n_spec / spec_s) / (n / plain_s):.2f}x); {passes} verify passes "
               f"({accepted}/{drafted} draft tokens accepted), {singles} single steps; "
               f"identical to reference for {same}/{n} tokens")
     for cfg, T in totals.items():
         say(f"TOTAL cfg (key,min_match,start,max,cooldown[,mode])={cfg}: {T['tokens']} tokens; plain {T['tokens'] / T['plain_s']:.1f} tok/s, "
-            f"copy-spec {T['tokens'] / T['spec_s']:.1f} tok/s ({T['plain_s'] / T['spec_s']:.2f}x); "
+            f"copy-spec {T['spec_tokens'] / T['spec_s']:.1f} tok/s "
+            f"({(T['spec_tokens'] / T['spec_s']) / (T['tokens'] / T['plain_s']):.2f}x); "
             f"{T['same']} of the runs fully identical")
 
 
