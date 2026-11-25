@@ -18,6 +18,7 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--context", type=int, default=8192)
     ap.add_argument("--ablate-only", action="store_true")
+    ap.add_argument("--indexer-variants", action="store_true", help="time stock vs fused indexer scoring (indexer_fused.py)")
     ap.add_argument("prompt")
     args = ap.parse_args()
     world = mx.distributed.init(); rank = world.rank()
@@ -107,6 +108,23 @@ def main():
     results.append(("indexer and every compressor free", timed_pipelined()))
     dl.Indexer.__call__ = orig_idx
     dl.Compressor.__call__ = orig_comp
+    if args.indexer_variants:
+        import indexer_fused
+        for m in idxs:
+            m.index_block = 0
+        results.append(("exact indexer, stock scoring", timed_pipelined()))
+        undo = indexer_fused.install("fused")
+        results.append(("exact indexer, fused scoring kernel", timed_pipelined()))
+        undo()
+        for mode, label in (("skip", "scoring + top-k skipped (upper bound)"),
+                            ("stock-scores-only", "stock scoring, top-k skipped"),
+                            ("scores-only", "fused scoring, top-k skipped"),
+                            ("topk-only", "scoring skipped, top-k kept")):
+            undo = indexer_fused.install(mode)
+            results.append((f"exact indexer, {label}", timed_pipelined()))
+            undo()
+        for m in idxs:
+            m.index_block = 64
     for name, t in results:
         print(f"[rank {rank}] ablation: {name}: {t * 1e3:.1f} ms per half (saves {(base - t) * 1e3:.1f} ms)", flush=True)
     if args.ablate_only:

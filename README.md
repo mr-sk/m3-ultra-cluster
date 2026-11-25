@@ -57,8 +57,9 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   expert kernels; 5 experts per token (+1.5%, lossy); prompt rules to batch reads;
   thinking mode.
 - **Next big lever:** fused Metal kernels for the sparse attention and indexer: decode
-  time goes to many small attention dispatches, not to reading weights (see
-  "Where a decoded token's time goes").
+  time goes to chains of small dependent attention kernels, not to reading weights.
+  Fusing single steps gained nothing (2026-11-25); it takes whole-chain kernels
+  (see "Kernel fusion and mlx-vlm 0.8.1").
 
 ## How this works, and what we learned
 
@@ -362,6 +363,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `copy_spec.py`, `spec_prompts.py` | `~/vlm-env` | Replay harness for copy-based speculative decoding (greedy or sampled), and its prompts |
 | `spec_sampling_test.py` | `~/vlm-env` | Offline: the server's speculative sampling emits the model's distribution (top_p included) |
 | `pin_snap_test.py` | `~/vlm-env` | Offline: session-start snapshots are taken and survive LRU eviction |
+| `indexer_fused.py`, `indexer_fused_test.py` | `~/vlm-env` | Experiment: fused Metal kernel for the indexer's scoring (no gain on its own; see "Kernel fusion") |
 | `precache_check.py` | `~/vlm-env` | Offline: would caching each reply have matched the next recorded request |
 | `runners/` | (any) | Restart the server, live checks, batches of OpenCode runs (see below) |
 
@@ -808,6 +810,32 @@ Also measured, no gain: MLX command-buffer limits (`MLX_MAX_OPS_PER_BUFFER=1000`
 `MLX_MAX_MB_PER_BUFFER=300`: 26.4 vs 26.5 tok/s, same cost curve); the fused gate+up and
 down expert kernels for one-token decode (identical tokens, 26.5 vs 26.9 tok/s). Decode
 does not slow down over a 1,200-token generation (26.2-26.9 tok/s throughout).
+
+### Kernel fusion and mlx-vlm 0.8.1 (2026-11-25): small or no gains
+
+**mlx-vlm 0.8.1** (side venv, mlx 0.32.4): its DeepSeek-V4 attention, indexer and HISA code
+is unchanged; its new kernels target short verify blocks and expert-parallel routing. Decode
+26.8 vs 26.5 tok/s (noise), verify costs the same at 4-128 tokens (2 tokens: 64 vs 51 ms).
+Not adopted.
+
+**Fused indexer scoring** (`indexer_fused.py`: one Metal kernel computes every compressed
+position's score over all 64 heads; matches the reference to 3e-7 with identical top-512,
+`indexer_fused_test.py`). `profile_half.py --indexer-variants`, 15k context, ms per half
+(rank 1 / rank 0):
+
+| Exact indexer variant | Rank 1 | Rank 0 |
+|---|---|---|
+| Stock scoring + top-k | 15.6 | 16.7 |
+| Fused scoring kernel + top-k | 15.6 | 16.9 |
+| Scores computed, top-k skipped | 15.4-15.8 | 16.8-17.1 |
+| Scoring skipped, top-k kept | 15.2 | 16.4 |
+| Both skipped (attention no longer waits on the indexer) | 14.5 | 15.3 |
+
+Neither the scoring nor the top-k is expensive on its own; what costs 1.1-1.4 ms per half is
+attention waiting on the indexer's chain of small dependent GPU steps (query projection,
+rotary, weights, compressor, scoring, selection). Fusing one link doesn't shorten the chain.
+The ceiling is ~7-8% of decode, reachable only by fusing the whole indexer (and, for more,
+the attention around it) into one or two kernels: a larger project than this.
 
 ### Caching each reply for the next turn (`--concurrent 2`)
 
