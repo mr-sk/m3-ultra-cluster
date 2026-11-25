@@ -987,6 +987,16 @@ path, and the server flags and proxy rules to restore after a test.
     PAIRS=3 runners/pairs.sh
   ```
 
+### runners/session_report.py: what real use looked like
+
+`python3 runners/session_report.py --days 7` (client Mac; reads the server logs on the head node
+over ssh and the proxy's recordings) reports requests and tokens, where the model's time went
+(decode vs prefill), token-weighted decode speed, copy-spec acceptance, prompt-cache hit rate,
+cold and very large prefills, context sizes, tool calls, problems (tool-call parse failures,
+loop stops, clients that went away, tracebacks, GPU timeouts, restarts) and agent sessions
+(turns per session). Meant to be run after a stretch of everyday use, to pick what to improve
+next from real sessions rather than Test B alone.
+
 ### runners/health.sh: health watch with alerts and safe restarts
 
 `runners/install_health.sh` (on the client Mac, no sudo) copies `node_status.sh` to both nodes
