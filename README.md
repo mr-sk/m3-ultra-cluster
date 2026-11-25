@@ -365,7 +365,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `pin_snap_test.py` | `~/vlm-env` | Offline: session-start snapshots are taken and survive LRU eviction |
 | `indexer_fused.py`, `indexer_fused_test.py` | `~/vlm-env` | Experiment: fused Metal kernel for the indexer's scoring (no gain on its own; see "Kernel fusion") |
 | `precache_check.py` | `~/vlm-env` | Offline: would caching each reply have matched the next recorded request |
-| `runners/` | (any) | Restart the server, live checks, batches of OpenCode runs (see below) |
+| `runners/` | (any) | Restart the server, live checks, batches of OpenCode runs, the health watch (see below) |
 
 The two venvs are separate on purpose. `~/cluster-env` has mlx-lm 0.32.2;
 `~/vlm-env` has mlx-vlm 0.7.12. Both pin mlx 0.32.4, which must match on both
@@ -986,6 +986,24 @@ path, and the server flags and proxy rules to restore after a test.
   TASK=task.txt REPO_A=~/src/app REPO_B=~/src/app-copy RULES=rules.txt OUT=runs \
     PAIRS=3 runners/pairs.sh
   ```
+
+### runners/health.sh: health watch with alerts and safe restarts
+
+`runners/install_health.sh` (on the client Mac, no sudo) copies `node_status.sh` to both nodes
+as `~/m3_node_status.sh` and loads a LaunchAgent (`com.m3cluster.health`) that runs
+`health.sh` every 2 minutes. It checks that the server answers `/health`, that both nodes are
+reachable, and on each node the GPU wired limit, the Thunderbolt IP, both RDMA links and free
+memory, plus new tracebacks in the server log. On a change (problem found, problem changed,
+healthy again) it posts a macOS notification and writes `~/dsv4-logs/health.log` (plus an
+hourly "still OK" line).
+
+It restarts only a dead server, with `EVERYDAY_FLAGS`: after 3 failed checks in a row, only if
+the wired limit, Thunderbolt IPs and RDMA links are fine, at most once per 30 minutes, and never
+while a benchmark from `~/mtp-bench` runs. After a reboot those prerequisites need sudo (see
+"Before any cluster run"), so it reports what's missing instead. `health.sh pause` / `resume`
+turn alerts and restarts off and on (for example while you stop the server on purpose);
+`DRY_RUN=1` logs what it would notify and restart without doing either.
+`install_health.sh --remove` uninstalls it.
 
 ## Copying models between the nodes
 
