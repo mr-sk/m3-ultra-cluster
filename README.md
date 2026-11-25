@@ -132,25 +132,57 @@ the wired limit held raised); touch every weight, one tensor per GPU command, at
 and before any job that follows more than 60 s of idle; and run a tiny warm-up generation
 before serving.
 
+**Two requests at once.** In a pipeline each machine idles while the other works on the
+token. With `--concurrent 2` the server fills that gap with a second request: orange runs
+its layers for request A while purple runs its layers for request B, and one `all_gather`
+per step swaps the hidden state one way and the sampled token the other. Both machines are
+busy every step, so two agents get ~49 tok/s combined (~25 each) instead of taking turns
+at ~29. An engine thread on purple owns all MLX work; orange follows the same protocol, and
+both make the same stop decisions from the same tokens. With only one request active it
+falls back to normal lockstep decoding (with copy-spec, section 6). Real agents: 6 Test B
+runs in 26.4 min two at a time, against ~41.5 min one after another; outputs identical to
+one-at-a-time decoding in greedy tests (`interleave_test.py` checks the scheduling offline).
+
 ### 3. Prefill, decode, and why decoding is slow
 
 Generating a reply has two phases:
 
 - **Prefill** reads the prompt. All its tokens go through the model together, so each
-  weight read from memory is used for hundreds of tokens. Here that runs at roughly
-  600-700 tokens/s, in chunks of 512 (larger chunks made the GPU time out).
+  weight read from memory is used for hundreds of tokens. Here that runs at ~700
+  tokens/s in chunks of 512 tokens, which measured fastest (256: 609, 1024: 678, 2048:
+  546 tok/s; 4096 made the GPU time out). It is limited by each machine's compute, and the
+  two machines already overlap on consecutive chunks.
 - **Decode** produces the reply one token at a time. Every token needs all the active
-  weights read from memory again, for just that one token, so speed is set by
-  [memory bandwidth](https://en.wikipedia.org/wiki/Memory_bandwidth), not by compute.
-  Here that's about 29 tokens/s.
+  weights read again for just that one token, so the textbook limit is
+  [memory bandwidth](https://en.wikipedia.org/wiki/Memory_bandwidth): ~10.5 GB of weights
+  per token, a floor of 6-9 ms per machine. Measured, each machine's half takes 16.6-18.1 ms,
+  about twice that, and decode runs at ~29 tokens/s. Profiling (`profile_half.py`) puts
+  most of the gap in attention: many small GPU kernels per layer, each with fixed launch
+  overhead (the sparse-attention indexer alone is ~2.5 ms per half). Reading fewer expert
+  weights barely helps (5 experts per token instead of 6: +1.5%).
 
-Coding agents send the whole conversation again on every turn, so the server keeps a
-[KV cache](https://huggingface.co/docs/transformers/main/en/kv_cache) of earlier prompts
-and only prefills what is new. In practice almost all of an agent run's time is decode:
-in four measured coding-task runs, 83% of the wall time was the model writing tokens,
-14% reading prompts, and about 3% the agent's own tools and tests. So a run takes
-roughly *tokens generated ÷ 29 tok/s*, and there are only two ways to make it faster:
-write fewer tokens, or write them faster. Sections 5 and 6 are about each.
+**Not reading things twice.** Coding agents send the whole conversation again on every
+turn, so the server keeps the model's attention state (its
+[KV cache](https://huggingface.co/docs/transformers/main/en/kv_cache)) for earlier
+prompts and only prefills what is new. DeepSeek-V4's cache mixes a sliding window with
+compressed (pooled) entries and can't be cut back to an earlier length, so instead the
+server keeps **snapshots**: copies of the cache at the end of each prompt and at turn
+boundaries inside long prompts, and a request resumes from the longest snapshot that is
+an exact prefix of it. Two additions made this cover nearly everything:
+
+- **The reply precache.** Snapshots are taken before the reply is generated, so each turn
+  used to re-read the previous reply (~550 tokens, ~1.4 s). Now, after each reply, the
+  server encodes the conversation with that reply exactly as the client will send it back
+  and reads it into the cache while the agent runs its tools. A typical turn then reads
+  ~39 new tokens (0.23 s).
+- **Session-start snapshots.** The system prompt and tool list (~8k tokens) are the same
+  in every session of a client. A snapshot at their end is pinned outside the cache's
+  least-recently-used eviction, so a new session starts in 3-5 s instead of ~15.
+
+Where an agent run's time goes now (4 Test B runs with copy-spec): ~75% decode, ~14%
+prefill (mostly first turns and large tool outputs), ~12% the agent's own tools, tests
+and gaps. So there are three ways to make a run faster: write fewer tokens (section 5),
+write them faster (section 6), and not re-read what was already read (above).
 
 ### 4. Making tool calls reliable
 
@@ -225,6 +257,10 @@ read the code or run the tests instead": faster still, but the model then delete
 existing tests to make failures go away, in every run. Rules make the model recheck what
 it already sees; they don't make it notice a meaning it missed. For that, the task text
 has to spell it out.
+
+That 29.3 min for 4 runs (~7.3 min each) was the starting point for the speed work of
+2026-11-20..24: with two agents sharing the pipeline, the cache additions above and
+copy-spec (section 6), a single Test B run now takes about 4-4.5 minutes.
 
 ### 6. Writing tokens faster: what didn't pay off, and what did
 
