@@ -48,7 +48,8 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   0.7.12's pipeline split dropped layer 21 until 2026-11-19; perplexity 6.20 to 6.02);
   DeepSeek tool-call repairs (`repeat_test.py`); exact sparse-attention selection in
   decode up to 64k tokens instead of mlx-vlm's HISA approximation (better predictions,
-  same speed, and needed for speculation: mlx-vlm's two HISA kernels disagree).
+  same speed, and needed for speculation: with HISA, a multi-token pass and one-token
+  decoding select quite different positions).
 - **Tried and not used:** the model's own DSpark/MTP drafter (2-8-token passes take
   mlx-vlm's slow bit-exact path: 5 tokens cost ~5x one); tensor parallelism (18.7
   tok/s: each all_sum after GPU work costs ~170-210 us); pipelined prefill (already
@@ -711,11 +712,14 @@ one pass inside mlx-vlm's speculative cache transaction (commit keeps only accep
 
 Divergences are near-ties resolving differently in the multi-token pass (e.g. "step 1 and 2
 in NoteStore.swift" vs "step 1: change NoteStore ..."; a test helper named `seedLegacy` vs
-`legacyBackend`), not corruption. One prerequisite found on the way: mlx-vlm decodes with
-HISA's one-token selection but multi-token passes use a different batched HISA kernel, and
-the two choose different positions (logits differed by up to 9.5, top token at 3 of 17
-positions). With exact selection in both, logits agree to 0.4-1.5 and the top token
-everywhere. Not in the server yet; agents sample at temperature 1 / top_p 0.95, which
+`legacyBackend`), not corruption. One prerequisite found on the way: with mlx-vlm's HISA
+selection, a 17-token pass and one-token decoding of the same tokens gave logits differing by
+up to 9.5 and a different top token at 3 of 17 positions; with exact selection, 0.4-1.5 and
+the same top token everywhere. Cause (2026-11-24, `copy_spec.py --debug-indexer`): the two HISA
+kernels agree on identical inputs, and the pass's causal masks are correct prefixes, but on
+real activations HISA's block-level choice amplifies the small numeric differences between a
+multi-token and a one-token pass: per-position overlap of the selected 512 positions averages
+397-491 per layer (as low as 15) with HISA, against 486-511 (never below 428) with exact top-k. Not in the server yet; agents sample at temperature 1 / top_p 0.95, which
 needs speculative-sampling acceptance instead of greedy matching.
 
 **In the server** (`--copy-spec`, engine path, lone request; two requests at once still

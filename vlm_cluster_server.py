@@ -1421,7 +1421,7 @@ class Engine:
         """Check a draft in one pass and keep the accepted part: returns the new tokens."""
         index = len(slot.tokens)
         inp = [slot.tokens[-1]] + draft
-        for m in self.indexers:  # exact top-k in the multi-token pass too (its HISA kernel differs)
+        for m in self.indexers:  # exact top-k in the multi-token pass too (HISA selections drift between pass shapes)
             m.index_block = 0
         tx = start_speculative_cache(slot.cache, len(inp))
         try:

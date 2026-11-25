@@ -39,6 +39,7 @@ ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--configs", default="", help="'key,min_match,start,max,cooldown/...' to sweep (overrides the single settings)")
 ap.add_argument("--only", type=int, default=-1, help="run one prompt index")
 ap.add_argument("--debug", action="store_true", help="compare a verify pass with one-token decoding, then stop")
+ap.add_argument("--debug-indexer", action="store_true", help="compare each indexer layer's selections: one 17-token pass vs one token at a time")
 ap.add_argument("--exact-indexer", action="store_true", help="exact top-k in every indexer (decode and multi-token), not HISA")
 args = ap.parse_args()
 
@@ -145,6 +146,61 @@ def main():
             mx.eval([c.state for c in base])
         first = int(mx.argmax(lm(mx.array(ids[-1:])[None], cache=base).logits[0, -1]).item())
         mx.eval([c.state for c in base])
+
+        if args.debug_indexer:
+            import mlx_vlm.models.deepseek_v4.language as dl
+            orig_call = dl.Indexer.__call__
+            log_ = []
+
+            def spy(self, x, q_residual, position_rope, pool_cache, offset):
+                out = orig_call(self, x, q_residual, position_rope, pool_cache, offset)
+                L = x.shape[1]
+                pm = pool_cache.make_mask(L, offset) if pool_cache is not None else None
+                info = None
+                if pm is not None:
+                    pm2 = pm if pm.ndim == 3 else pm[None]
+                    rows = mx.broadcast_to(pm2, (1, L, pm2.shape[-1]))
+                    vl = rows.sum(-1).tolist()[0]
+                    # is each row's visible set a prefix [0, valid_len)?
+                    pref = [bool(mx.all(rows[0, j, :vl[j]]).item()) and not bool(mx.any(rows[0, j, vl[j]:]).item())
+                            for j in range(L)]
+                    info = (vl, all(pref))
+                log_.append((id(self), L, None if out is None else out.tolist(), info))
+                return out
+
+            dl.Indexer.__call__ = spy
+            draft = ids[2000:2016]
+            inp = [first] + draft
+            c = copy.deepcopy(base); mx.eval([x.state for x in c])
+            log_.clear()
+            for t_ in inp:
+                mx.eval(lm(mx.array([[t_]]), cache=c).logits)
+            single = [e for e in log_ if e[1] == 1]
+            c = copy.deepcopy(base); mx.eval([x.state for x in c])
+            log_.clear()
+            mx.eval(lm(mx.array(inp)[None], cache=c).logits)
+            block = list(log_)
+            dl.Indexer.__call__ = orig_call
+            layers = []
+            for e in block:
+                if e[0] not in layers:
+                    layers.append(e[0])
+            for li, lid in enumerate(layers):
+                b = next(e for e in block if e[0] == lid)
+                s_rows = [e for e in single if e[0] == lid]
+                if b[2] is None:
+                    say(f"indexer {li}: no selection (pool too small)"); continue
+                ov = []
+                for j in range(len(inp)):
+                    sb = set(b[2][0][j]) if len(b[2][0]) > j else set()
+                    ss = set(s_rows[j][2][0][0]) if j < len(s_rows) and s_rows[j][2] is not None else set()
+                    ov.append(len(sb & ss))
+                vl_info = b[3]
+                say(f"indexer {li}: block vs one-token overlap per position min {min(ov)}, mean {sum(ov)/len(ov):.0f} of {len(b[2][0][0])}; "
+                    f"block pass mask: {'none' if vl_info is None else ('prefix rows' if vl_info[1] else 'NOT prefix')}"
+                    f"{'' if vl_info is None else f', visible lengths {vl_info[0][0]}..{vl_info[0][-1]}'}; "
+                    f"one-token masks: {sorted(set('none' if e[3] is None else 'mask' for e in s_rows))}")
+            return
 
         if args.debug:
             draft = ids[2000:2016]  # 16 tokens of real text as the draft
