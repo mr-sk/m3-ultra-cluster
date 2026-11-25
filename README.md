@@ -23,37 +23,41 @@ All commands run **on purple**, the first node in `~/m3-ultra-jaccl.json`.
   `--concurrent 2` lets two agents share the cluster and `--copy-spec` drafts copied text
   for a lone request (both below); leave them out for the original one-request-at-a-time
   path.
-- **Speed:** ~29 tok/s decoding, ~700 tok/s reading new prompt tokens; a prompt
-  that repeats an earlier prefix is read from a cache.
+- **Speed:** decode ~29 tok/s per token, ~41 tok/s effective on agent work with
+  `--copy-spec` (it drafts text the model copies from its context); ~700 tok/s reading
+  new prompt tokens. Prompts that repeat an earlier prefix are read from a cache.
 - **Coding agent:** OpenCode through `record_proxy.py --rules working_rules.txt
   --fill-edit-path` on the client Mac, which adds the working rules to every agent
   turn and fills an edit call's missing `path` when the history makes it
   unambiguous. Test B (a Swift change with a data migration and tests) runs
-  unattended in ~7 min: 4 runs in 29.3 min, all finishing with tests passing.
-- **DeepSeek tool-call fixes in the server** (`repeat_test.py`): identical or
-  conflicting repeated DSML parameters, calls cut off by the loop guard, calls left
-  open when the next one starts.
-- **All 43 layers run** (`split_test.py`): mlx-vlm 0.7.12's pipeline split drops a
-  layer when the layer count doesn't divide evenly; until 2026-11-19 layer 21 ran
-  nowhere. The server now installs mlx-lm's split (perplexity 6.20 to 6.02).
+  unattended in **~4-4.5 min** with all tests passing (6.55 min before copy-spec
+  and the cache work of 2026-11-20..24, ~7 min before that).
+- **Copy-based speculative decoding** (`--copy-spec`): the next 12-64 tokens are
+  drafted from earlier text in the context (edits copy file contents; 63% of agent
+  output repeats 8+ tokens of its prompt) and checked in one pass; exact for the
+  sampler. 1.64x decode on 24 recorded agent turns at temperature 1; Test B mean
+  4.03-4.48 min across the last batches.
+- **Prompt cache:** snapshots during prefill (DeepSeek-V4's cache can't be trimmed),
+  the model's own reply cached while the agent runs its tools (a typical turn reads
+  ~39 new tokens instead of ~550), and a pinned snapshot of the shared system prompt
+  + tools, so a new session starts in 3-5 s instead of ~15.
 - **Two agents at once:** `--concurrent 2` interleaves two requests across the
-  pipeline (our everyday setting; off unless passed): 6 agent runs in 26.4 min instead of ~41.5, a lone
-  request decodes at about normal speed (28.6-28.9 tok/s).
-- **Each reply is cached for the next turn** (with `--concurrent 2`): while the agent
-  runs its tools, the server reads its own reply into the prompt cache, so a typical
-  turn reads ~39 new tokens (0.23 s) instead of ~550 (1.4 s); 71 of 75 turns hit.
-- **Exact sparse-attention selection in decode** below 48k tokens of context, instead
-  of mlx-vlm's approximate HISA: same speed, better predictions on text that repeats
-  earlier context (0.54 vs 0.68 nats/token).
-- **Copy-based speculative decoding** (`--copy-spec`, with `--concurrent 2`, off unless
-  passed): drafts the model's next 12-64 tokens from earlier text in its context (edits
-  copy file contents) and checks them in one pass. Test B, one agent at a time: 4.97 min
-  per run instead of 6.55 (-24%), decode 39.0 tok/s instead of ~28.5, all tests passing.
-  Our everyday setting since 2026-11-23.
-- **Tried and not used:** speculative decoding with the model's own DSpark drafter
-  (correct, but verifying 5 tokens costs ~5x one, so slower); tensor parallelism,
-  both nodes on every layer (18.7 tok/s against 29.3: each all_sum after GPU work
-  costs ~170-210 us); thinking mode (no gain on Test B).
+  pipeline: 6 agent runs in 26.4 min instead of ~41.5. (Copy-spec applies to a lone
+  request.)
+- **Correctness fixes in the server:** all 43 layers run (`split_test.py`: mlx-vlm
+  0.7.12's pipeline split dropped layer 21 until 2026-11-19; perplexity 6.20 to 6.02);
+  DeepSeek tool-call repairs (`repeat_test.py`); exact sparse-attention selection in
+  decode up to 64k tokens instead of mlx-vlm's HISA approximation (better predictions,
+  same speed, and needed for speculation: mlx-vlm's two HISA kernels disagree).
+- **Tried and not used:** the model's own DSpark/MTP drafter (2-8-token passes take
+  mlx-vlm's slow bit-exact path: 5 tokens cost ~5x one); tensor parallelism (18.7
+  tok/s: each all_sum after GPU work costs ~170-210 us); pipelined prefill (already
+  overlapped); other prefill chunk sizes; MLX command-buffer limits; fused one-token
+  expert kernels; 5 experts per token (+1.5%, lossy); prompt rules to batch reads;
+  thinking mode.
+- **Next big lever:** fused Metal kernels for the sparse attention and indexer: decode
+  time goes to many small attention dispatches, not to reading weights (see
+  "Where a decoded token's time goes").
 
 ## How this works, and what we learned
 
@@ -221,7 +225,7 @@ existing tests to make failures go away, in every run. Rules make the model rech
 it already sees; they don't make it notice a meaning it missed. For that, the task text
 has to spell it out.
 
-### 6. Writing tokens faster: two experiments that didn't pay off
+### 6. Writing tokens faster: what didn't pay off, and what did
 
 **Speculative decoding** ([Leviathan et al.](https://arxiv.org/abs/2211.17192)) uses a
 small, fast "drafter" to guess several next tokens, then checks all the guesses with one
@@ -232,9 +236,11 @@ to [multi-token prediction](https://arxiv.org/abs/2404.19737) as used in
 [DeepSeek-V3](https://arxiv.org/abs/2412.19437). Getting it to run across two machines
 took two fixes (`bench_mtp.py`), and it was correct and accurate: up to 4.6 tokens
 accepted per round. But it was slower, 24.8 against 28.8 tok/s, because checking 5
-tokens took 155 ms against 29 ms for one. In an MoE model each token goes to its own
-experts, so checking 5 tokens reads close to 5 times the expert weights, and decode is
-limited by reading weights: there is nothing to win.
+tokens took 155 ms against 29 ms for one. We first read this as a law of MoE models
+(each token goes to its own experts). It wasn't: mlx-vlm runs passes of 2-8 tokens
+through "exact" kernels that reproduce one-token results bit for bit, and from 9 tokens
+uses the batched path prefill uses, where a token costs 10.6 ms at 9 and 4.3 ms at 128
+(`verify_cost.py`). Long drafts are cheap per token; 5-token drafts landed on the slow path.
 
 **Tensor parallelism** ([Megatron-LM](https://arxiv.org/abs/1909.08053)) splits every
 layer across both machines instead of splitting the layer stack. Both machines then work
@@ -248,13 +254,29 @@ and hand over to the CPU first. 86 of those per token outweigh the half of the w
 reading saved. If MLX could make that handoff close to the bare time, tensor parallelism
 would by our estimate reach about 50 tok/s; that is a question for MLX itself.
 
+**Copy-based speculative decoding** is what did pay off. A coding agent's output repeats
+its context: an edit's `oldString` is file text it read, and 63% of recorded output tokens
+sit in runs of 8+ tokens copied from the prompt (`copy_check.py`). So the "drafter" is a
+lookup: find the current text earlier in the context, propose what followed it (12-64
+tokens), and check it in one pass; mlx-vlm's speculative cache transaction keeps only the
+accepted tokens. With temperature sampling each drafted token is accepted with the
+probability the model gives it, which keeps the output distribution exact
+([speculative sampling](https://arxiv.org/abs/2302.01318), with a one-token draft
+distribution). Related published work: [prompt lookup decoding](https://github.com/apoorvumang/prompt-lookup-decoding),
+[SuffixDecoding](https://arxiv.org/abs/2411.04975). Here: 1.64x decode on recorded agent
+turns, Test B runs about a third shorter.
+
 ### 7. Where that leaves things
 
-Decoding at ~29 tok/s is close to what this hardware and software can do; the speed-ups
-that worked came from the agent writing fewer, better-aimed tokens. The model still
-misses an occasional requirement (about 1 run in 4 in recent Test B batches), so its work needs
-reviewing, but a typical Test B run now finishes unattended in about 7 minutes with all
-tests passing.
+One token still takes ~34 ms (~29 tok/s), about twice the time it takes to read that
+token's weights: the gap is many small attention kernels, not memory. What made agent
+work faster came from the workload: copying text the model would type anyway
+(copy-spec), not re-reading what was already read (prompt-cache snapshots, the reply
+precache, session-start snapshots), sharing the pipeline between two agents, and fewer,
+better-aimed tokens (working rules). A typical Test B run now finishes unattended in
+about 4-4.5 minutes with all tests passing; the model still misses an occasional
+requirement, so its work needs reviewing. The next large step would be fused Metal
+kernels for the sparse attention and indexer (community ports of this model have them).
 
 ## Before any cluster run
 
@@ -298,6 +320,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mlx-server.pli
 | `record_proxy.py` | (any, stdlib) | Recording proxy between a client and the server; can add working rules to every agent turn |
 | `bench_mtp.py` | `~/vlm-env` | Speculative decoding with DeepSeek-V4-Flash-0731's DSpark drafter on the pipelined cluster (experiment: no speedup) |
 | `allsum_repro.py` | `~/vlm-env` | Times JACCL all_sum alone vs after GPU work (why tensor parallelism loses) |
+| `verify_cost.py` | `~/vlm-env` | Cost of one forward pass over n tokens (n = 1..128), and decode rate over a long generation |
+| `copy_check.py` | `~/vlm-env` | Offline: how much recorded agent output copies text already in its prompt |
+| `copy_spec.py`, `spec_prompts.py` | `~/vlm-env` | Replay harness for copy-based speculative decoding (greedy or sampled), and its prompts |
+| `spec_sampling_test.py` | `~/vlm-env` | Offline: the server's speculative sampling emits the model's distribution (top_p included) |
+| `pin_snap_test.py` | `~/vlm-env` | Offline: session-start snapshots are taken and survive LRU eviction |
+| `precache_check.py` | `~/vlm-env` | Offline: would caching each reply have matched the next recorded request |
+| `runners/` | (any) | Restart the server, live checks, batches of OpenCode runs (see below) |
 
 The two venvs are separate on purpose. `~/cluster-env` has mlx-lm 0.32.2;
 `~/vlm-env` has mlx-vlm 0.7.12. Both pin mlx 0.32.4, which must match on both
@@ -316,6 +345,18 @@ nohup ~/cluster-env/bin/python ~/cluster_launch.py --backend jaccl --hostfile ~/
 
 curl -s localhost:8090/health
 ```
+
+Flags that change speed or behaviour (`--help` lists all):
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--concurrent 2` | 1 | Two requests at once, interleaved across the pipeline (engine path) |
+| `--copy-spec` | off | With `--concurrent 2`: copy-based speculative decoding for a lone request |
+| `--hisa-min-pooled N` | 16000 | Exact indexer top-k in decode below N compressed positions (4 tokens each); 0 = mlx-vlm's HISA |
+| `--cache-max-snapshots N` / `--cache-budget-tokens N` | 40 / 1,200,000 | Prompt-cache size (~3.8 KB per token) |
+| `--prefill-step N` | 512 | Prefill chunk size (512 measured fastest) |
+| `--experts-per-token N` | model's (6) | Fewer routed experts per token; lossy, experiments only |
+| `--no-prompt-cache` | | Turn the prompt cache off |
 
 Client settings (Cline "OpenAI Compatible", Continue, curl):
 
