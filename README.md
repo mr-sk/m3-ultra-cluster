@@ -987,6 +987,25 @@ path, and the server flags and proxy rules to restore after a test.
     PAIRS=3 runners/pairs.sh
   ```
 
+### Using it day to day, in any project
+
+Nothing here is per-repo. On the client Mac:
+
+- OpenCode's config is global (`~/.config/opencode/opencode.jsonc`): its provider points at
+  `http://127.0.0.1:8091/v1`, so `cd` into any project and run `opencode`.
+- The recording proxy is a login service (`runners/install_proxy.sh`, LaunchAgent
+  `com.m3cluster.proxy`): started at login, restarted if it exits, with the everyday rules
+  (`EVERYDAY_RULES`) and edit-path filling. The rules are general (small steps, short text
+  before tool calls, the edit-call format, run the tests, the self-check), and path filling and
+  copy-spec work on whatever files a session reads. Test runners swap in a proxy with their own
+  rules and hand the port back to the service when they finish.
+- The health watch (`runners/install_health.sh`) also checks that the proxy listens, and kicks
+  the service if it doesn't.
+- Project-specific instructions belong in the task you give OpenCode: OpenCode 2.2.6 ignores
+  `AGENTS.md`.
+- The proxy records every request and reply under `~/dsv4-proxy/<date>/` (for
+  `runners/session_report.py` and replays); nothing leaves the Mac and the cluster.
+
 ### runners/session_report.py: what real use looked like
 
 `python3 runners/session_report.py --days 7` (client Mac; reads the server logs on the head node

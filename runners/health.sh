@@ -1,7 +1,8 @@
 #!/bin/bash
 # Cluster health watch, run every 2 minutes on the client Mac by a LaunchAgent (install_health.sh).
 #
-# Checks: the server answers /health; both nodes are reachable; on each node the GPU wired limit,
+# Checks: the server answers /health; the proxy on this Mac listens (restarted via its
+# LaunchAgent if installed); both nodes are reachable; on each node the GPU wired limit,
 # the Thunderbolt IP, both RDMA links and free memory; new tracebacks in the server log.
 # Alerts: a macOS notification when the state changes (problem found, problem changed, healthy
 # again), and a line in ~/dsv4-logs/health.log.
@@ -49,6 +50,15 @@ while read -r line; do
   [ "$bench" -gt 0 ] 2>/dev/null && bench=1
   [ "$free" != "?" ] && [ "$free" -lt "$MIN_FREE_PCT" ] 2>/dev/null && problems+=("$host: only $free% memory free")
 done <<< "$nodes"
+
+# the recording proxy OpenCode talks to (this Mac)
+if ! nc -z -G 3 127.0.0.1 "$PROXY_PORT" 2>/dev/null; then
+  if [ -f "$HOME/Library/LaunchAgents/com.m3cluster.proxy.plist" ] && [ -z "$DRY_RUN" ]; then
+    launchctl kickstart -k "gui/$(id -u)/com.m3cluster.proxy" 2>/dev/null; sleep 3
+  fi
+  nc -z -G 3 127.0.0.1 "$PROXY_PORT" 2>/dev/null \
+    || problems+=("proxy not listening on 127.0.0.1:$PROXY_PORT (OpenCode can't reach the cluster; runners/install_proxy.sh)")
+fi
 
 prev_tb=$(get tracebacks "${tb:-0}")
 if [ -n "$tb" ] && [ "$tb" -gt "$prev_tb" ] 2>/dev/null; then problems+=("new traceback in the server log on $HEAD"); fi

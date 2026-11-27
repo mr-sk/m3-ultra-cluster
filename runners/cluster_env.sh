@@ -33,11 +33,23 @@ restart_server() {
 }
 
 # restart_proxy RULES_FILE: (re)start record_proxy.py on this machine with those rules.
+# If the proxy runs as the login service (install_proxy.sh), the everyday rules hand the port
+# back to the service, and any other rules (a test) stop the service and run a proxy of their own.
+PROXY_AGENT=com.m3cluster.proxy
 restart_proxy() {
-  local pid; pid=$(lsof -nP -t -iTCP:"$PROXY_PORT" -sTCP:LISTEN)
+  local plist=$HOME/Library/LaunchAgents/$PROXY_AGENT.plist pid
+  if [ -f "$plist" ]; then
+    launchctl bootout "gui/$(id -u)/$PROXY_AGENT" 2>/dev/null
+    sleep 1
+  fi
+  pid=$(lsof -nP -t -iTCP:"$PROXY_PORT" -sTCP:LISTEN)
   [ -n "$pid" ] && kill $pid && sleep 1
-  nohup python3 "$PROXY_SCRIPT" --port "$PROXY_PORT" --upstream "$SERVER_URL" --rules "$1" --fill-edit-path \
-    > "$PROXY_LOG" 2>&1 < /dev/null &
-  disown 2>/dev/null  # it outlives this script; and no "Terminated" notice when it is replaced
+  if [ -f "$plist" ] && [ "$1" = "$EVERYDAY_RULES" ]; then
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+  else
+    nohup python3 "$PROXY_SCRIPT" --port "$PROXY_PORT" --upstream "$SERVER_URL" --rules "$1" --fill-edit-path \
+      > "$PROXY_LOG" 2>&1 < /dev/null &
+    disown 2>/dev/null  # it outlives this script; and no "Terminated" notice when it is replaced
+  fi
   sleep 2; tail -1 "$PROXY_LOG"
 }
